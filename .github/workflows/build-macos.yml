@@ -8,6 +8,10 @@ on:
   pull_request:
     branches: [master]
 
+# 默认 GITHUB_TOKEN 为只读，创建 Release 需要显式授予写入权限
+permissions:
+  contents: write
+
 jobs:
   build-macos:
     name: Build SmartPDF Pro (.app)
@@ -30,24 +34,35 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build app bundle
-        run: ./build_app.sh release
+      # 一次构建产出 x86_64 / arm64 / Universal 三个 .app
+      - name: Build app bundles (all archs)
+        run: ./build_app.sh release all
 
-      - name: Zip .app (保留 .app 包结构)
-        run: ditto -c -k --sequesterRsrc --keepParent "dist/SmartPDF Pro.app" "SmartPDF-Pro-macOS.zip"
+      # 分别打包三个 zip，保留 .app 包结构
+      - name: Zip x86_64
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/SmartPDF Pro (x86_64).app" "SmartPDF-Pro-macOS-x86_64.zip"
+      - name: Zip arm64
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/SmartPDF Pro (arm64).app" "SmartPDF-Pro-macOS-arm64.zip"
+      - name: Zip universal
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/SmartPDF Pro (Universal).app" "SmartPDF-Pro-macOS-universal.zip"
 
-      - name: Upload build artifact
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: SmartPDF-Pro-macOS
-          path: SmartPDF-Pro-macOS.zip
+          path: |
+            SmartPDF-Pro-macOS-x86_64.zip
+            SmartPDF-Pro-macOS-arm64.zip
+            SmartPDF-Pro-macOS-universal.zip
           if-no-files-found: error
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: SmartPDF-Pro-macOS.zip
-          generate_release_notes: true
+          files: |
+            SmartPDF-Pro-macOS-x86_64.zip
+            SmartPDF-Pro-macOS-arm64.zip
+            SmartPDF-Pro-macOS-universal.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

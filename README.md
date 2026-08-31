@@ -76,17 +76,24 @@ cargo run --example render_check
 ## 打包成 macOS 应用（.app）
 
 ```bash
-./build_app.sh            # 一键打包（release），产出 dist/SmartPDF Pro.app
-open "dist/SmartPDF Pro.app"   # 像普通 Mac 应用一样启动（Finder 双击亦可）
+./build_app.sh                     # 一键打包（release），默认产出 x86_64 / arm64 / Universal 三个版本
+./build_app.sh release x86_64      # 仅 Intel
+./build_app.sh release arm64       # 仅 Apple Silicon
+./build_app.sh release universal   # 仅通用二进制（lipo 合并）
+open "dist/SmartPDF Pro (Universal).app"   # 像普通 Mac 应用一样启动（Finder 双击亦可）
 ```
 
+`build_app.sh [release|dev] [all|x86_64|arm64|universal]`：第二参数默认 `all`，一次构建三架构。
+Universal 版由 `lipo` 合并 x86_64 与 arm64 二进制，可在两种 Mac 上运行。
+CI（GitHub Actions）在打 `v*` tag 时也会同时构建三架构并作为三个 zip 发布到 Release。
+
 打包内容：
-- `Contents/MacOS/SmartPDF Pro` — release 可执行文件
+- `Contents/MacOS/SmartPDF Pro` — release 可执行文件（对应架构）
 - `Contents/Resources/AppIcon.icns` — 应用图标（由 `assets/icon-1024.png` 经 `iconutil` 生成；
   该 PNG 同时内嵌进二进制作为窗口图标与 Dock 图标，三者同源）
 - `Contents/Info.plist` — Bundle 元信息（源码见 `packaging/Info.plist`）
 
-> 应用未签名/未公证（本地开发用途），首次启动如被 Gatekeeper 拦截，
+> 应用为 ad-hoc 自签名（本地开发用途），首次启动如被 Gatekeeper 拦截，
 > 在 Finder 中右键应用 →「打开」即可放行。
 
 ## 架构
