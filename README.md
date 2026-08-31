@@ -3,7 +3,7 @@
 用 **Rust** 重构、面向 **macOS** 的轻量多格式阅读器（PDF / EPUB / MOBI / CBZ / FB2 / XPS 等），
 **界面为纯 Rust 方案（egui）**。
 
-灵感来源于 [SumatraPDF](https://www.sumatrapdfreader.org/)（原仓库 `small32/sumatrapdf_mac`）：
+灵感来源于 [SumatraPDF](https://www.sumatrapdfreader.org/)：
 多格式、轻量、快速打开、标签页浏览。
 
 ---
