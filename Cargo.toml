@@ -1,0 +1,31 @@
+[package]
+name = "smartpdf-pro"
+version = "0.1.0"
+edition = "2024"
+description = "SmartPDF Pro - 面向 macOS 的轻量多格式阅读器（PDF/EPUB/CBZ 等）"
+
+[dependencies]
+# MuPDF 安全 Rust 绑定，默认 features 自带 PDF/EPUB/MOBI/CBZ/FB2/XPS/SVG 支持
+mupdf = "0.8"
+# 纯 Rust 即时模式 GUI
+eframe = "0.36"
+egui = "0.36"
+# 原生系统菜单栏（macOS 顶部菜单），动作经 channel 转发给 egui
+objc2 = "0.6.4"
+# block2 特性提供 NSAnimationContext::runAnimationGroup（异步窗口缩放动画）
+objc2-app-kit = { version = "0.3.2", features = ["block2"] }
+objc2-foundation = "0.3.2"
+# 动画 block（NSAnimationContext 回调）
+block2 = "0.6"
+# 原生文件选择对话框（macOS 上用系统面板）
+rfd = "0.15"
+env_logger = "0.11"
+log = "0.4"
+image = "0.25.10"
+
+# mupdf 是巨型 C 代码，debug 模式下也关掉 debug 信息以显著加快增量编译
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
