@@ -3,6 +3,7 @@ name: Build macOS
 on:
   push:
     branches: [master]
+    tags: ['v*']
   workflow_dispatch:
   pull_request:
     branches: [master]
@@ -32,9 +33,21 @@ jobs:
       - name: Build app bundle
         run: ./build_app.sh release
 
-      - name: Upload .app artifact
+      - name: Zip .app (保留 .app 包结构)
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/SmartPDF Pro.app" "SmartPDF-Pro-macOS.zip"
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: SmartPDF-Pro-macOS
-          path: dist/SmartPDF Pro.app
+          path: SmartPDF-Pro-macOS.zip
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SmartPDF-Pro-macOS.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
