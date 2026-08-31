@@ -1,7 +1,11 @@
-//! 标签页层：一个文档一个标签，维护当前页、缩放与多页渲染缓存。
+//! 文档会话层：维护当前页、缩放与多页渲染缓存。
 //!
 //! 渲染在独立线程中进行：UI 线程通过 channel 发请求、按期接收
 //! 像素结果后上传 GPU 纹理，避免大页面渲染阻塞界面。
+//!
+//! 渲染分辨率按当前屏幕倍率（pixels_per_point）计算：Retina 屏上
+//! 以 2x 物理像素渲染，避免纹理被拉伸导致的发虚；缓存 key 含倍率，
+//! 窗口在不同倍率的显示器间移动时自动按新倍率重新渲染。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,22 +18,25 @@ use egui::{
 
 use crate::document::{scale_px_per_pt, Document, RenderedPage};
 
-/// 渲染请求（UI → 渲染线程）。
+/// 渲染请求（UI → 渲染线程）。`scale` 已含屏幕倍率，线程内直接使用。
 struct RenderRequest {
     page: usize,
     zoom: f32,
     scale: f32,
+    /// 请求时的屏幕倍率（随结果原样回传，用于构造缓存 key）。
+    ppp: f32,
 }
 
 /// 渲染结果（渲染线程 → UI）。
 struct RenderResult {
     page: usize,
     zoom: f32,
+    ppp: f32,
     rendered: RenderedPage,
 }
 
-/// 缓存 key：页码 + 缩放千分比。
-type RenderKey = (usize, u32);
+/// 缓存 key：页码 + 缩放千分比 + 屏幕倍率千分比。
+type RenderKey = (usize, u32, u32);
 
 /// UI 线程持有的页面缓存（GPU 纹理）。
 struct CachedPage {
@@ -45,6 +52,7 @@ fn render_worker(path: PathBuf, rx: Receiver<RenderRequest>, tx: Sender<RenderRe
             page,
             zoom,
             scale,
+            ppp,
         } = req;
         if doc.is_none() {
             match Document::open(&path) {
@@ -54,13 +62,18 @@ fn render_worker(path: PathBuf, rx: Receiver<RenderRequest>, tx: Sender<RenderRe
         }
         if let Some(d) = doc.as_ref() {
             if let Ok(rendered) = d.render_page(page, scale) {
-                let _ = tx.send(RenderResult { page, zoom, rendered });
+                let _ = tx.send(RenderResult {
+                    page,
+                    zoom,
+                    ppp,
+                    rendered,
+                });
             }
         }
     }
 }
 
-/// 每个打开的文档对应一个标签页。
+/// 当前打开的文档（单文档会话）。
 pub struct DocTab {
     pub path: PathBuf,
     pub title: String,
@@ -73,6 +86,8 @@ pub struct DocTab {
     pub fit_width: bool,
     /// 上次计算 fit_width 时的 viewport 宽度（用于避免每帧振荡重算）。
     pub fit_width_viewport: f32,
+    /// 当前屏幕倍率（Retina 为 2.0）；渲染 scale 与缓存 key 都含它。
+    pixel_ratio: f32,
     /// 多页渲染缓存，缓存页数上限见 [`Self::CACHE_LIMIT`]。
     caches: HashMap<RenderKey, CachedPage>,
     /// 插入顺序（用于清理最旧缓存）。
@@ -84,8 +99,9 @@ pub struct DocTab {
 }
 
 impl DocTab {
-    /// 缓存页数上限：缩略图与正文共存（不同缩放），太小会频繁淘汰导致反复渲染。
-    const CACHE_LIMIT: usize = 64;
+    /// 缓存页数上限：纹理按屏幕倍率渲染（Retina 为 4 倍内存），32 张在
+    /// 清晰度与内存之间平衡；缩略图与正文共存（不同缩放各自占 key）。
+    const CACHE_LIMIT: usize = 32;
 
     pub fn open(path: &Path) -> Result<Self, String> {
         let doc = Document::open(path)?;
@@ -107,6 +123,7 @@ impl DocTab {
             zoom: 1.0,
             fit_width: true,
             fit_width_viewport: 0.0,
+            pixel_ratio: 1.0,
             caches: HashMap::new(),
             order: Vec::new(),
             req_tx,
@@ -115,8 +132,18 @@ impl DocTab {
         })
     }
 
-    fn key(page: usize, zoom: f32) -> RenderKey {
-        (page, (zoom * 1000.0).round() as u32)
+    /// 同步屏幕倍率（窗口移到不同分辨率的显示器时由 UI 每帧调用）。
+    /// 倍率参与缓存 key：变化后旧倍率纹理不再命中，按新倍率重新渲染。
+    pub fn set_pixel_ratio(&mut self, ppp: f32) {
+        self.pixel_ratio = ppp;
+    }
+
+    fn key(&self, page: usize, zoom: f32) -> RenderKey {
+        (
+            page,
+            (zoom * 1000.0).round() as u32,
+            (self.pixel_ratio * 1000.0).round() as u32,
+        )
     }
 
     pub fn page_size_pt(&self) -> (f32, f32) {
@@ -134,14 +161,20 @@ impl DocTab {
     // ---- 渲染请求 / 结果收集 ----
 
     /// 请求渲染指定页（未缓存且不在途时才发送）。
+    /// 渲染 scale = 逻辑缩放 × 屏幕倍率：以物理像素出图，Retina 不发虚。
     pub fn request_render(&mut self, page: usize, zoom: f32) {
-        let key = Self::key(page, zoom);
+        let key = self.key(page, zoom);
         if self.caches.contains_key(&key) || self.pending.contains(&key) {
             return;
         }
         self.pending.insert(key);
-        let scale = scale_px_per_pt(zoom);
-        let _ = self.req_tx.send(RenderRequest { page, zoom, scale });
+        let scale = scale_px_per_pt(zoom) * self.pixel_ratio;
+        let _ = self.req_tx.send(RenderRequest {
+            page,
+            zoom,
+            scale,
+            ppp: self.pixel_ratio,
+        });
     }
 
     /// 收集渲染结果并上传纹理；返回是否有新缓存插入（调用方可据此决定是否重绘）。
@@ -149,9 +182,24 @@ impl DocTab {
     pub fn poll_render(&mut self, ctx: &Context) -> bool {
         let mut inserted = false;
         while let Ok(res) = self.res_rx.try_recv() {
-            let key = Self::key(res.page, res.zoom);
+            // 用结果自带的请求时倍率构造 key，与 pending 精确对上
+            let key = (
+                res.page,
+                (res.zoom * 1000.0).round() as u32,
+                (res.ppp * 1000.0).round() as u32,
+            );
             self.pending.remove(&key);
-            log::debug!("渲染完成: page={} zoom_permille={}", res.page, key.1);
+            // 倍率已变化（窗口移到了另一块显示器）：旧倍率纹理不作废缓存，
+            // 直接丢弃，等当前倍率的新请求出图
+            if key.2 != (self.pixel_ratio * 1000.0).round() as u32 {
+                continue;
+            }
+            log::debug!(
+                "渲染完成: page={} zoom_permille={} ppp_permille={}",
+                res.page,
+                key.1,
+                key.2
+            );
             // 已缓存同 key，跳过（worker 可能重复返回同一请求）
             if self.caches.contains_key(&key) {
                 continue;
@@ -176,29 +224,31 @@ impl DocTab {
 
     // ---- 获取显示纹理 ----
 
-    /// 指定页的显示纹理（优先精确缩放，其次该页任意缩放，避免翻页白屏）。
+    /// 当前页在当前缩放下的纹理（优先精确缩放，其次该页任意缩放，避免翻页白屏）。
     pub fn display_texture_for(&self, page: usize) -> Option<TextureId> {
         self.display_texture_at(page, self.zoom)
     }
 
     /// 指定缩放下的页面纹理（优先精确 key，其次该页任意缩放）。
     pub fn display_texture_at(&self, page: usize, zoom: f32) -> Option<TextureId> {
-        if let Some(c) = self.caches.get(&Self::key(page, zoom)) {
+        if let Some(c) = self.caches.get(&self.key(page, zoom)) {
             return Some(c.handle.id());
         }
         self.caches
             .iter()
-            .find(|((p, _), _)| *p == page)
+            .find(|((p, _, _), _)| *p == page)
             .map(|(_, c)| c.handle.id())
     }
 
     /// 仅精确匹配指定缩放的纹理（演示模式用，避免低清缩略图拉伸模糊）。
     pub fn texture_exact(&self, page: usize, zoom: f32) -> Option<TextureId> {
         self.caches
-            .get(&Self::key(page, zoom))
+            .get(&self.key(page, zoom))
             .map(|c| c.handle.id())
     }
-}#[cfg(test)]
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -218,12 +268,14 @@ mod tests {
                 page: 0,
                 zoom: 1.0,
                 scale: 1.5,
+                ppp: 1.0,
             })
             .unwrap();
         drop(req_tx); // 让 worker 循环在完成后退出
 
         let res = res_rx.recv_timeout(Duration::from_secs(15)).unwrap();
         assert_eq!(res.page, 0);
+        assert_eq!(res.ppp, 1.0);
         assert!(res.rendered.width > 0 && res.rendered.height > 0);
         assert_eq!(
             res.rendered.rgba.len(),

@@ -42,6 +42,7 @@ pub enum SysCmd {
     Single,
     Continuous,
     Presentation,
+    ToggleThumbs,
 }
 
 static TX: OnceLock<Mutex<Sender<SysCmd>>> = OnceLock::new();
@@ -166,6 +167,11 @@ define_class!(
         #[unsafe(method(startPresentation:))]
         fn start_presentation(&self, _sender: &AnyObject) {
             send(SysCmd::Presentation);
+        }
+
+        #[unsafe(method(toggleThumbs:))]
+        fn toggle_thumbs(&self, _sender: &AnyObject) {
+            send(SysCmd::ToggleThumbs);
         }
     }
 );
@@ -412,6 +418,8 @@ pub fn install() {
     let view_menu = NSMenu::new(mtm);
     view_menu.addItem(&menu_item(mtm, Some(&target), "单页", "singlePageView:", ""));
     view_menu.addItem(&menu_item(mtm, Some(&target), "连续显示页面", "continuousView:", ""));
+    // F9 的按键等价物是功能键专用码位（F1=\u{F704} … F9=\u{F70C}）
+    view_menu.addItem(&menu_item(mtm, Some(&target), "缩略图面板", "toggleThumbs:", "\u{F70C}"));
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
     view_menu.addItem(&menu_item(mtm, Some(&target), "统一页宽", "toggleFitWidth:", ""));
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));

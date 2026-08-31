@@ -1,10 +1,11 @@
 //! 主界面（egui 纯 Rust 方案）。
 //!
-//! 布局（对齐 SumatraPDF 经典布局）：
-//! - 顶部：菜单栏（文件/视图/前往/缩放，中文）
-//! - 左侧：页面缩略图导航（点击跳页）
+//! 布局（macOS 原生风格，单窗口单文档）：
+//! - 顶部标题栏：左上留空（红黄绿三色按钮区），中央显示当前文件名，
+//!   右上放「侧栏开关」「＋ 打开」两个图标按钮
+//! - 左侧：页面缩略图导航（可收起，F9 / 标题栏按钮 / 菜单切换）
 //! - 中央：整篇文档纵向连续滚动（滚动条拖动浏览全部页面）
-//! - 底部：状态栏（页码 / 缩放比例）
+//! - 底部：状态栏（页码 / 缩放比例 / 状态消息）
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,24 +32,20 @@ const THUMB_ZOOM: f32 = 0.3;
 const THUMB_WIDTH: f32 = 108.0;
 const PAGE_GAP: f32 = 18.0;
 
-// ---- 标签条尺寸 ----
-/// 与 macOS 标题栏等高，标签才能与左上的红黄绿三色按钮齐平。
-const TAB_H: f32 = 28.0;
-/// 标题栏三色按钮占据的宽度，标签栏需从此处之后开始。
+/// 常用缩放档位（与菜单「缩放」中的百分比一致）。
+const ZOOM_STEPS: [f32; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+
+// ---- 标题栏尺寸 ----
+/// 标题栏内容行高：与 macOS 标题栏等高，和左上红黄绿三色按钮齐平。
+const TITLEBAR_H: f32 = 28.0;
+/// 标题栏三色按钮占据的宽度；文件名居中时两侧各预留这么宽，避免遮挡。
 const TITLEBAR_BUTTONS_W: f32 = 72.0;
-/// 标签内文字左右内边距。
-const TAB_PAD_X: f32 = 10.0;
-/// 标题与 × 之间的间距。
-const TAB_TEXT_GAP: f32 = 6.0;
-/// 标签内关闭按钮的边长。
-const TAB_CLOSE_W: f32 = 15.0;
-const TAB_ROUNDING: u8 = 10;
-/// 标签之间的水平间距。
-const TAB_SPACING: f32 = 4.0;
-/// 空间不足时标题可被压缩到的最小宽度。
-const TAB_TEXT_MIN_W: f32 = 40.0;
-/// 单个标签除标题外的固定宽度（左右内边距 + 标题与 × 的间距 + × 按钮）。
-const TAB_FIXED_W: f32 = TAB_PAD_X * 2.0 + TAB_TEXT_GAP + TAB_CLOSE_W;
+/// 标题栏右侧图标按钮的边长。
+const TITLEBAR_BTN: f32 = 26.0;
+/// 右侧按钮与窗口右缘的间距。
+const TITLEBAR_BTN_MARGIN: f32 = 10.0;
+/// 右侧两个按钮之间的间距。
+const TITLEBAR_BTN_GAP: f32 = 6.0;
 
 /// 去掉标题末尾的扩展名（如 "demo.pdf" → "demo"；"v1.2 报告" 保留）。
 /// 只在最后一段像扩展名（长度 ≤ 5 且前段非空）时去除，避免误伤文件名中的点。
@@ -61,11 +58,51 @@ fn strip_extension(title: &str) -> String {
     }
 }
 
-/// 标签上发生的动作。
-enum TabAction {
-    None,
-    Activate,
-    Close,
+/// 适应宽度的结果**向下**吸附到最近的标准档位（差距 ≤12% 时生效），
+/// 让默认窗口尺寸下直接显示整洁的 100% / 125% 等百分比而非 109% 这类碎数。
+/// 只向下吸附：页面永远不会比精确适配更宽，避免左右边缘被裁切。
+fn snap_fit_zoom(fit: f32) -> f32 {
+    ZOOM_STEPS
+        .iter()
+        .rev()
+        .copied()
+        .find(|&s| s <= fit && (fit - s) / s <= 0.12)
+        .unwrap_or(fit)
+}
+
+/// 手动缩放（⌘+/⌘-）的结果就近吸附到标准档位（±6% 以内），
+/// 连击几次后仍落在干净百分比上。
+fn snap_zoom_nearest(z: f32) -> f32 {
+    ZOOM_STEPS
+        .iter()
+        .copied()
+        .min_by(|a, b| (z - a).abs().partial_cmp(&(z - b).abs()).unwrap())
+        .filter(|&s| (z - s).abs() / s <= 0.06)
+        .unwrap_or(z)
+}
+
+/// 等比调节颜色明度（f < 1 变暗，> 1 变亮），用于 chrome 面板底色。
+fn shade(c: egui::Color32, f: f32) -> egui::Color32 {
+    let ch = |v: u8| (v as f32 * f).clamp(0.0, 255.0) as u8;
+    egui::Color32::from_rgba_unmultiplied(ch(c.r()), ch(c.g()), ch(c.b()), c.a())
+}
+
+/// 标题栏 / 侧栏 / 状态栏的「chrome」底色：比正文区深（浅色主题则浅）一档，
+/// 让导航区与内容区有安静的层次区分。
+fn panel_fill(ui: &egui::Ui) -> egui::Color32 {
+    let v = ui.visuals();
+    shade(v.panel_fill, if v.dark_mode { 0.88 } else { 0.965 })
+}
+
+/// chrome 与正文区之间的发丝分割线（1px，深浅主题各自取灰）。
+fn hairline(ui: &egui::Ui) -> egui::Stroke {
+    let v = ui.visuals();
+    let color = if v.dark_mode {
+        Color32::from_gray(48)
+    } else {
+        Color32::from_gray(214)
+    };
+    egui::Stroke::new(1.0, color)
 }
 
 /// 标题的排版任务：`max_width` 为 `f32::INFINITY` 时完整显示不截断。
@@ -80,13 +117,11 @@ fn title_job(
         egui::TextFormat {
             font_id: font_id.clone(),
             color,
-            // 同一行内中英文混排时，不同字体的字形默认按上/下边界对齐，
-            // 会出现扩展名".pdf"比中文文件名高一截/低一截；按中线对齐可解决。
+            // 同一行内中英文混排时按中线对齐，避免扩展名比中文文件名高一截。
             valign: egui::Align::Center,
             ..Default::default()
         },
     );
-    // 强制单行：若允许换行，文件名与扩展名会被折成上下两行（一高一低）
     job.wrap.max_width = max_width;
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
@@ -96,146 +131,78 @@ fn title_job(
     job
 }
 
-/// 为各标签分配标题宽度：放得下就完整显示；放不下只压缩真正超宽的标签。
-///
-/// 做法是反复把剩余预算平分给尚未定下的标签，宽度够用的先按完整宽度固定
-/// 并从预算中扣除，剩下的继续平分，直到全部定下（water-filling）。
-fn fit_title_widths(ui: &egui::Ui, titles: &[String], avail: f32) -> Vec<f32> {
-    let font_id = egui::TextStyle::Button.resolve(ui.style());
-    let mut widths: Vec<f32> = titles
-        .iter()
-        .map(|t| {
-            ui.painter()
-                .layout_job(title_job(&font_id, egui::Color32::PLACEHOLDER, t, f32::INFINITY))
-                .size()
-                .x
-        })
-        .collect();
-
-    let budget = avail
-        - widths.len() as f32 * TAB_FIXED_W
-        - widths.len().saturating_sub(1) as f32 * TAB_SPACING;
-    if widths.iter().sum::<f32>() <= budget {
-        return widths; // 横向放得下：完整文件名
-    }
-
-    let mut budget = budget;
-    let mut pending: Vec<usize> = (0..widths.len()).collect();
-    while !pending.is_empty() {
-        let share = budget / pending.len() as f32;
-        let fits: Vec<usize> = pending
-            .iter()
-            .copied()
-            .filter(|&i| widths[i] <= share)
-            .collect();
-        if fits.is_empty() {
-            // 剩下的都放不下：统一压到当前份额（不低于下限）
-            for i in &pending {
-                widths[*i] = share.max(TAB_TEXT_MIN_W);
-            }
-            break;
-        }
-        for i in &fits {
-            budget -= widths[*i];
-        }
-        pending.retain(|i| !fits.contains(i));
-    }
-    widths
-}
-
-/// 一体化标签：标题与 × 关闭按钮画在同一个控件里，共用底色与中心线。
-/// `max_text_w` 是该标题可用的最大宽度（由 [`fit_title_widths`] 分配）。
-fn tab_item(ui: &mut egui::Ui, title: &str, is_active: bool, max_text_w: f32) -> TabAction {
-    // 先把需要的颜色拷出来（Color32 是 Copy），避免后续 &mut ui 时借用冲突
-    let (text_color, strong_color) = {
+/// 标题栏「＋ 打开文档」按钮。图标用画笔自绘（两条正交线），
+/// 不依赖字体符号在不同分辨率/字体下的渲染差异。
+fn plus_button(ui: &mut egui::Ui, center: egui::Pos2) -> bool {
+    let rect = egui::Rect::from_center_size(center, egui::vec2(TITLEBAR_BTN, TITLEBAR_BTN));
+    let resp = ui.allocate_rect(rect, egui::Sense::click());
+    let (dark, text) = {
         let v = ui.visuals();
-        (v.text_color(), v.strong_text_color())
+        (v.dark_mode, v.text_color())
     };
-    let font_id = egui::TextStyle::Button.resolve(ui.style());
-    let text_color = if is_active { strong_color } else { text_color };
-
-    let galley = ui
-        .painter()
-        .layout_job(title_job(&font_id, text_color, title, max_text_w));
-
-    let size = egui::vec2(TAB_FIXED_W + galley.size().x, TAB_H);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-
-    // 仿 Chrome 标签：柔和半透明底色（仅在 hover/激活时浮现），圆角更柔，线条更轻
-    let dark = ui.visuals().dark_mode;
-    let hover_fill = if dark {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 22)
-    } else {
-        Color32::from_rgba_unmultiplied(0, 0, 0, 12)
-    };
-    let active_fill = if dark {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 40)
-    } else {
-        Color32::from_rgba_unmultiplied(0, 0, 0, 24)
-    };
-    let fill = if is_active {
-        Some(active_fill)
-    } else if resp.hovered() {
-        Some(hover_fill)
-    } else {
-        None
-    };
-    if let Some(fill) = fill {
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(TAB_ROUNDING), fill);
-    }
-
-    // 标题与 × 共用同一条垂直中心线（按字形包围盒居中，避开行距造成的偏移）
-    let center_y = rect.center().y;
-    ui.painter().galley(
-        egui::pos2(
-            rect.left() + TAB_PAD_X,
-            center_y - galley.mesh_bounds.center().y,
-        ),
-        galley,
-        text_color,
-    );
-
-    // 关闭按钮：仿 Chrome 的小圆点，hover 时显示淡灰圆底，平时只显示一个低调的 ×
-    let close_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.right() - TAB_PAD_X - TAB_CLOSE_W / 2.0, center_y),
-        egui::vec2(TAB_CLOSE_W, TAB_CLOSE_W),
-    );
-    let close_resp = ui.allocate_rect(close_rect, egui::Sense::click());
-    if close_resp.hovered() {
-        let close_hover = if dark {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 46)
+    if resp.hovered() {
+        let fill = if dark {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 42)
         } else {
-            Color32::from_rgba_unmultiplied(0, 0, 0, 28)
+            Color32::from_rgba_unmultiplied(0, 0, 0, 26)
         };
         ui.painter()
-            .circle_filled(close_rect.center(), TAB_CLOSE_W / 2.0, close_hover);
+            .rect_filled(rect, egui::CornerRadius::same(7), fill);
     }
-    let x_color = if close_resp.hovered() {
-        strong_color
-    } else {
-        text_color.gamma_multiply(0.7)
-    };
-    ui.painter().text(
-        close_rect.center(),
-        Align2::CENTER_CENTER,
-        "×",
-        font_id,
-        x_color,
+    let stroke = egui::Stroke::new(1.7, text);
+    let r = 4.6;
+    ui.painter().line_segment(
+        [egui::pos2(center.x - r, center.y), egui::pos2(center.x + r, center.y)],
+        stroke,
     );
+    ui.painter().line_segment(
+        [egui::pos2(center.x, center.y - r), egui::pos2(center.x, center.y + r)],
+        stroke,
+    );
+    resp.on_hover_text("打开文档（⌘O）").clicked()
+}
 
-    if close_resp.clicked() || resp.double_clicked() {
-        TabAction::Close
-    } else if resp.clicked() {
-        TabAction::Activate
-    } else {
-        TabAction::None
+/// 标题栏「缩略图侧栏」开关按钮：圆角矩形 + 左侧竖线的经典侧栏图标。
+/// `active`（侧栏可见）时底色常显、图标着色，开关状态一目了然。
+fn thumbs_button(ui: &mut egui::Ui, center: egui::Pos2, active: bool) -> bool {
+    let rect = egui::Rect::from_center_size(center, egui::vec2(TITLEBAR_BTN, TITLEBAR_BTN));
+    let resp = ui.allocate_rect(rect, egui::Sense::click());
+    let (dark, strong, weak) = {
+        let v = ui.visuals();
+        (v.dark_mode, v.strong_text_color(), v.weak_text_color())
+    };
+    if active || resp.hovered() {
+        let alpha = if active { 44 } else { 30 };
+        let fill = if dark {
+            Color32::from_rgba_unmultiplied(255, 255, 255, alpha)
+        } else {
+            Color32::from_rgba_unmultiplied(0, 0, 0, alpha - 8)
+        };
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(7), fill);
     }
+    let stroke = egui::Stroke::new(1.4, if active { strong } else { weak });
+    let icon = egui::Rect::from_center_size(center, egui::vec2(14.0, 14.0));
+    ui.painter().rect_stroke(
+        icon,
+        egui::CornerRadius::same(3),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    let split = icon.left() + 4.5;
+    ui.painter().line_segment(
+        [
+            egui::pos2(split, icon.top() + 2.5),
+            egui::pos2(split, icon.bottom() - 2.5),
+        ],
+        stroke,
+    );
+    resp.on_hover_text("缩略图侧栏（F9）").clicked()
 }
 
 pub struct SmartPdfApp {
-    tabs: Vec<DocTab>,
-    active: Option<usize>,
+    /// 当前文档（单窗口单文档；打开新文档替换旧的，旧渲染线程随通道关闭退出）。
+    tab: Option<DocTab>,
     view_mode: ViewMode,
     status: String,
     /// 连续模式下需要滚动到的页（翻页/缩略图跳页后置位，下一帧应用）。
@@ -244,17 +211,19 @@ pub struct SmartPdfApp {
     presenting: bool,
     /// Dock 图标是否已在首帧设置（窗口创建后才能覆盖 winit 写入的默认图标）。
     dock_icon_done: bool,
-    /// 统一标题栏是否已在首帧设置（内容延伸到标题栏，标签栏与三色按钮同行）。
+    /// 统一标题栏是否已在首帧设置（内容延伸到标题栏，与三色按钮同行）。
     titlebar_done: bool,
-    /// 标签栏相对窗口顶部的上边距：使标签垂直中心对齐三色按钮中心（运行时测得）。
-    titlebar_tab_top: f32,
-    /// 本帧双击是否落在标签/按钮上（用于抑制"双击标题栏放大"，避免误关标签）。
+    /// 标题栏内容行相对窗口顶部的上边距：垂直中心对齐三色按钮中心（运行时测得）。
+    titlebar_top: f32,
+    /// 本帧点击是否落在标题栏按钮上（用于抑制「双击标题栏放大」误触发）。
     titlebar_double_consumed: bool,
     /// 手动检测标题栏双击：上次单击的时间与位置。
     titlebar_dbl_time: f64,
     titlebar_dbl_pos: egui::Pos2,
-    /// 上一帧视口尺寸：用于检测窗口缩放/拖拽，主动触发重绘避免标签栏滞后。
+    /// 上一帧视口尺寸：用于检测窗口缩放/拖拽，主动触发重绘避免界面滞后。
     last_viewport: egui::Vec2,
+    /// 缩略图侧栏是否展开（F9 / 标题栏按钮 / 菜单「缩略图面板」切换）。
+    show_thumbs: bool,
 }
 
 impl SmartPdfApp {
@@ -266,19 +235,19 @@ impl SmartPdfApp {
         crate::sysmenu::set_context(cc.egui_ctx.clone());
         crate::sysmenu::install();
         let mut app = Self {
-            tabs: Vec::new(),
-            active: None,
+            tab: None,
             view_mode: ViewMode::Continuous,
             status: String::new(),
             scroll_target: None,
             presenting: false,
             dock_icon_done: false,
             titlebar_done: false,
-            titlebar_tab_top: 0.0,
+            titlebar_top: 0.0,
             titlebar_double_consumed: false,
             titlebar_dbl_time: -1.0,
             titlebar_dbl_pos: egui::Pos2::ZERO,
             last_viewport: egui::Vec2::ZERO,
+            show_thumbs: true,
         };
         for f in files {
             app.open_path(&f);
@@ -286,24 +255,21 @@ impl SmartPdfApp {
         app
     }
 
-    fn active_idx(&self) -> Option<usize> {
-        self.active.filter(|i| *i < self.tabs.len())
-    }
-
     // ---- 打开 / 关闭 ----
 
+    /// 打开文档（单文档模型：替换当前文档）。
     fn open_path(&mut self, path: &Path) {
-        if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
-            self.active = Some(i);
-            self.status = format!("已在标签页中打开：{}", path.display());
+        if self.tab.as_ref().is_some_and(|t| t.path == path) {
+            self.status = format!("文档已打开：{}", path.display());
             return;
         }
         match DocTab::open(path) {
             Ok(tab) => {
                 let title = tab.title.clone();
-                self.tabs.push(tab);
-                self.active = Some(self.tabs.len() - 1);
-                self.status = format!("已打开「{}」", title);
+                // 旧 tab 置换析构 → 请求通道关闭 → 渲染线程退出，无泄漏
+                self.tab = Some(tab);
+                self.scroll_target = Some(0);
+                self.status = format!("已打开「{title}」");
             }
             Err(e) => self.status = format!("无法打开 {}：{}", path.display(), e),
         }
@@ -321,207 +287,171 @@ impl SmartPdfApp {
         }
     }
 
-    fn close_active(&mut self) {
-        let Some(i) = self.active_idx() else {
-            return;
-        };
-        self.close_tab(i);
+    /// 关闭当前文档（应用保持运行）。
+    fn close_doc(&mut self) {
+        if let Some(t) = self.tab.take() {
+            self.status = format!("已关闭「{}」", t.title);
+            self.scroll_target = None;
+        }
     }
 
-    /// 关闭指定索引的标签页（参照 SumatraPDF 的 WindowTab）。
-    fn close_tab(&mut self, idx: usize) {
-        if idx >= self.tabs.len() {
+    /// 设置缩略图侧栏展开/收起。收起会改变正文可用宽度，但视口宽度不变、
+    /// 不会触发 fit_width 的重算判据，这里清零记录宽度强制重新适配。
+    fn set_thumbs(&mut self, show: bool) {
+        if self.show_thumbs == show {
             return;
         }
-        let removed = self.tabs.remove(idx).title.clone();
-        self.status = format!("已关闭「{}」", removed);
-        self.active = if self.tabs.is_empty() {
-            None
+        self.show_thumbs = show;
+        if let Some(t) = self.tab.as_mut() {
+            t.fit_width_viewport = 0.0;
+        }
+    }
+
+    fn toggle_thumbs(&mut self) {
+        let show = !self.show_thumbs;
+        self.set_thumbs(show);
+    }
+
+    // ---- 顶部标题栏 ----
+
+    /// 标题栏：左上避开红黄绿三色按钮；文件名窗口居中（超长以 … 截断）；
+    /// 右上放「侧栏开关」「＋ 打开」两个图标按钮，保持左上区域干净。
+    fn titlebar_panel(&mut self, ui: &mut egui::Ui) {
+        let (rect, _resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), TITLEBAR_H),
+            egui::Sense::click(),
+        );
+        let center_y = rect.center().y;
+
+        // 中央文件名（先快照，避免与后续 &mut self 的借用冲突）
+        let (title, has_doc) = match self.tab.as_ref() {
+            Some(t) => (strip_extension(&t.title), true),
+            None => ("SmartPDF Pro".to_string(), false),
+        };
+        let font_id = egui::TextStyle::Button.resolve(ui.style());
+        let text_color = if has_doc {
+            ui.visuals().text_color()
         } else {
-            Some(idx.min(self.tabs.len() - 1))
+            ui.visuals().weak_text_color()
         };
-        self.scroll_target = self.active.and_then(|i| Some(self.tabs.get(i)?.page));
-    }
+        let max_w = (rect.width() - TITLEBAR_BUTTONS_W * 2.0).max(60.0);
+        let galley = ui
+            .painter()
+            .layout_job(title_job(&font_id, text_color, &title, max_w));
+        ui.painter().galley(
+            egui::pos2(
+                rect.center().x - galley.mesh_bounds.center().x,
+                center_y - galley.mesh_bounds.center().y,
+            ),
+            galley,
+            text_color,
+        );
 
-    // ---- 顶部标签栏 ----
-
-    fn tabs_panel(&mut self, ui: &mut egui::Ui) {
-        // 强制标签栏行高恒定为 TAB_H：有文档时行高由 tab_item 撑满为 28，
-        // 但无文档时面板里仅剩「＋」按钮，行高会退化为按钮自然高度（更矮），
-        // 导致整条栏相对三色按钮中心上偏错位。统一行高可让两者始终垂直对齐。
-        ui.style_mut().spacing.interact_size.y = TAB_H;
-        // 先快照标签信息，避免闭包内对 self 的借用冲突；标签只显示文件名不显示扩展名
-        let items: Vec<(usize, String, bool)> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (i, strip_extension(&t.title), self.active == Some(i)))
-            .collect();
-        let titles: Vec<String> = items.iter().map(|(_, t, _)| t.clone()).collect();
-
-        let mut activate: Option<usize> = None;
-        let mut close: Option<usize> = None;
-
-        // 垂直居中的横排标签栏：每个标签自带关闭按钮
-        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            // 空出左上角红黄绿三色按钮的位置（标签栏延伸到标题栏后需避开）
-            ui.add_space(TITLEBAR_BUTTONS_W);
-            ui.spacing_mut().item_spacing.x = TAB_SPACING;
-            // 仿 Chrome 的新标签圆形按钮：固定正方形画成圆形，平时透明、hover 浮现淡灰圆底
-            let plus_font = egui::TextStyle::Button.resolve(ui.style());
-            let plus_text = ui.painter().layout_job(title_job(
-                &plus_font,
-                ui.visuals().text_color(),
-                "＋",
-                f32::INFINITY,
-            ));
-            let (plus_rect, plus_resp) =
-                ui.allocate_exact_size(egui::vec2(TAB_H, TAB_H), egui::Sense::click());
-            if plus_resp.hovered() {
-                let dark = ui.visuals().dark_mode;
-                let plus_hover = if dark {
-                    Color32::from_rgba_unmultiplied(255, 255, 255, 46)
-                } else {
-                    Color32::from_rgba_unmultiplied(0, 0, 0, 28)
-                };
-                ui.painter()
-                    .circle_filled(plus_rect.center(), TAB_H / 2.0, plus_hover);
-            }
-            // 用字形包围盒居中（与标签页同法），避免全角「＋」度量偏高导致上偏
-            ui.painter().galley(
-                egui::pos2(
-                    plus_rect.center().x - plus_text.mesh_bounds.center().x,
-                    plus_rect.center().y - plus_text.mesh_bounds.center().y,
-                ),
-                plus_text,
-                ui.visuals().text_color(),
-            );
-            if plus_resp.on_hover_text("打开文档（⌘O）").clicked() {
-                self.titlebar_double_consumed = true;
-                self.pick_and_open();
-            }
-        // 有文档才显示分隔符与标签
-        if items.is_empty() {
-            return;
+        // 右侧按钮组：从右往左为 ＋ 打开、侧栏开关
+        let plus_center = egui::pos2(rect.right() - TITLEBAR_BTN_MARGIN - TITLEBAR_BTN / 2.0, center_y);
+        let side_center = egui::pos2(
+            plus_center.x - TITLEBAR_BTN - TITLEBAR_BTN_GAP,
+            center_y,
+        );
+        let plus_clicked = plus_button(ui, plus_center);
+        let thumbs_clicked = thumbs_button(ui, side_center, self.show_thumbs);
+        if plus_clicked || thumbs_clicked {
+            self.titlebar_double_consumed = true;
         }
-        ui.separator();
-            // ＋ 与分隔符之后剩下的宽度才是标签可用宽度
-            let widths = fit_title_widths(ui, &titles, ui.available_width());
-            for ((idx, title, is_active), max_text_w) in items.into_iter().zip(widths) {
-                match tab_item(ui, &title, is_active, max_text_w) {
-                    TabAction::Close => {
-                        // 双击标签关闭：标记 consumed 以免触发"双击标题栏放大"
-                        self.titlebar_double_consumed = true;
-                        close = Some(idx);
-                    }
-                    TabAction::Activate => activate = Some(idx),
-                    TabAction::None => {}
-                }
-            }
-        });
-
-        if let Some(idx) = activate {
-            if self.active != Some(idx) {
-                self.active = Some(idx);
-                if let Some(p) = self.tabs.get(idx) {
-                    self.scroll_target = Some(p.page);
-                }
-            }
+        if thumbs_clicked {
+            self.toggle_thumbs();
         }
-        if let Some(idx) = close {
-            self.close_tab(idx);
+        if plus_clicked {
+            self.pick_and_open();
         }
     }
 
     // ---- 页面导航 / 缩放 ----
 
     fn goto(&mut self, page: usize) {
-        let Some(i) = self.active_idx() else {
+        let Some(tab) = self.tab.as_mut() else {
             return;
         };
-        let clamped = page.min(self.tabs[i].doc.page_count.saturating_sub(1));
-        if self.tabs[i].page != clamped {
-            self.tabs[i].goto(clamped);
+        let clamped = page.min(tab.doc.page_count.saturating_sub(1));
+        if tab.page != clamped {
+            tab.goto(clamped);
             self.scroll_target = Some(clamped);
         }
     }
 
     fn navigate(&mut self, delta: isize) {
-        let Some(i) = self.active_idx() else {
-            return;
+        let target = match self.tab.as_ref() {
+            Some(t) => (t.page as isize + delta).max(0) as usize,
+            None => return,
         };
-        let target = (self.tabs[i].page as isize + delta).max(0) as usize;
         self.goto(target);
     }
 
     fn zoom(&mut self, factor: f32) {
-        let Some(i) = self.active_idx() else {
+        let Some(tab) = self.tab.as_mut() else {
             return;
         };
-        self.tabs[i].zoom = (self.tabs[i].zoom * factor).clamp(0.05, 8.0);
-        self.tabs[i].fit_width = false;
+        tab.zoom = snap_zoom_nearest((tab.zoom * factor).clamp(0.05, 8.0));
+        tab.fit_width = false;
     }
 
     fn zoom_percent(&mut self, pct: f32) {
-        let Some(i) = self.active_idx() else {
+        let Some(tab) = self.tab.as_mut() else {
             return;
         };
-        self.tabs[i].zoom = (pct / 100.0).clamp(0.05, 8.0);
-        self.tabs[i].fit_width = false;
+        tab.zoom = (pct / 100.0).clamp(0.05, 8.0);
+        tab.fit_width = false;
     }
 
     fn toggle_fit_width(&mut self) {
-        let Some(i) = self.active_idx() else {
+        let Some(tab) = self.tab.as_mut() else {
             return;
         };
-        self.tabs[i].fit_width = !self.tabs[i].fit_width;
+        tab.fit_width = !tab.fit_width;
     }
 
     // ---- 渲染收集 ----
 
     fn poll(&mut self, ctx: &egui::Context) {
-        let mut any = false;
-        for tab in &mut self.tabs {
-            any |= tab.poll_render(ctx);
-        }
-        if any {
-            ctx.request_repaint();
+        if let Some(tab) = self.tab.as_mut() {
+            if tab.poll_render(ctx) {
+                ctx.request_repaint();
+            }
         }
     }
-
 
     // ---- 左侧缩略图面板 ----
 
     fn thumb_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(i) = self.active_idx() else {
-            // 未打开文档时保持左侧面板为空
+        let Some(tab) = self.tab.as_mut() else {
             return;
         };
-        let page_count = self.tabs[i].doc.page_count;
+        let page_count = tab.doc.page_count;
 
         // 平均缩略图高度（作为 show_rows 行高，只渲染可见缩略图）
         let mut sum_h = 0.0f32;
         for p in 0..page_count {
-            let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
+            let (w_pt, h_pt) = tab.doc.page_size_pt(p);
             sum_h += THUMB_WIDTH * h_pt / w_pt.max(0.01);
         }
         let row_h = sum_h / page_count.max(1) as f32 + 6.0;
 
+        let mut jump_to: Option<usize> = None;
         ScrollArea::vertical()
             .id_salt("thumbs")
             .show_rows(ui, row_h, page_count, |ui, range| {
                 for p in range {
-                    let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
+                    let (w_pt, h_pt) = tab.doc.page_size_pt(p);
                     let h = THUMB_WIDTH * h_pt / w_pt.max(0.01);
                     // 只对可见缩略图发起渲染请求
-                    self.tabs[i].request_render(p, THUMB_ZOOM);
+                    tab.request_render(p, THUMB_ZOOM);
                     let panel_w = ui.available_width();
                     let resp = ui
                         .allocate_ui_with_layout(
                             Vec2::new(panel_w, h),
                             Layout::centered_and_justified(egui::Direction::LeftToRight),
                             |ui| {
-                                if let Some(tid) = self.tabs[i].display_texture_at(p, THUMB_ZOOM) {
+                                if let Some(tid) = tab.display_texture_at(p, THUMB_ZOOM) {
                                     ui.image(SizedTexture::new(tid, Vec2::new(THUMB_WIDTH, h)));
                                 } else {
                                     ui.allocate_space(Vec2::new(THUMB_WIDTH, h));
@@ -530,19 +460,28 @@ impl SmartPdfApp {
                         )
                         .response;
                     if resp.clicked() {
-                        self.tabs[i].goto(p);
-                        self.scroll_target = Some(p);
+                        jump_to = Some(p);
                     }
                     ui.add_space(6.0);
                 }
             });
+        // 点击缩略图跳页（闭包外应用，避免与 tab 的借用冲突）
+        if let Some(p) = jump_to {
+            if let Some(t) = self.tab.as_mut() {
+                t.goto(p);
+            }
+            self.scroll_target = Some(p);
+        }
     }
 
     // ---- 中央文档面板 ----
 
     fn doc_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(i) = self.active_idx() else {
-            // 未打开文档时保持中央区域为空
+        let Some(tab) = self.tab.as_mut() else {
+            // 未打开文档：给出打开指引（配合拖放打开）
+            ui.centered_and_justified(|ui| {
+                ui.weak(egui::RichText::new("把文件拖进窗口，或按 ⌘O 打开文档").small());
+            });
             return;
         };
         let ctx = ui.ctx().clone();
@@ -552,32 +491,30 @@ impl SmartPdfApp {
         // 适应宽度：只在窗口宽度真实变化（>4px）时重算缩放。
         // 若每帧用 available_width 重算，垂直滚动条出现/消失会让宽度微变 → zoom 振荡、
         // 页面反复以不同缩放渲染（闪烁）。用 viewport 宽度做判据一次性更新。
-        {
-            let tab = &mut self.tabs[i];
-            if tab.fit_width {
-                let vw = ui
-                    .ctx()
-                    .input(|i| i.viewport().inner_rect.map(|r| r.width()).unwrap_or(0.0));
-                if (vw - tab.fit_width_viewport).abs() > 4.0 {
-                    let (pw, _) = tab.page_size_pt();
-                    tab.zoom = (avail_w / (pw * scale_px_per_pt(1.0))).clamp(0.05, 8.0);
-                    tab.fit_width_viewport = vw;
-                }
+        if tab.fit_width {
+            let vw = ctx
+                .input(|i| i.viewport().inner_rect.map(|r| r.width()).unwrap_or(0.0));
+            if (vw - tab.fit_width_viewport).abs() > 4.0 {
+                let (pw, _) = tab.page_size_pt();
+                // 先按可视宽精确计算，再向下吸附到最近的标准百分比（100%/125%…）
+                let fit = (avail_w / (pw * scale_px_per_pt(1.0))).clamp(0.05, 8.0);
+                tab.zoom = snap_fit_zoom(fit);
+                tab.fit_width_viewport = vw;
             }
         }
 
-        let zoom = self.tabs[i].zoom;
-        let page_count = self.tabs[i].doc.page_count;
+        let zoom = tab.zoom;
+        let page_count = tab.doc.page_count;
         let px_per_pt = scale_px_per_pt(zoom);
         let gap = PAGE_GAP;
 
         match self.view_mode {
             ViewMode::Single => {
-                let page = self.tabs[i].page;
-                self.tabs[i].request_render(page, zoom);
+                let page = tab.page;
+                tab.request_render(page, zoom);
                 ui.centered_and_justified(|ui| {
-                    if let Some(tid) = self.tabs[i].display_texture_for(page) {
-                        let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(page);
+                    if let Some(tid) = tab.display_texture_for(page) {
+                        let (w_pt, h_pt) = tab.doc.page_size_pt(page);
                         let w = w_pt * px_per_pt / ppp;
                         let h = h_pt * px_per_pt / ppp;
                         ui.image(SizedTexture::new(tid, Vec2::new(w, h)));
@@ -586,30 +523,35 @@ impl SmartPdfApp {
             }
             ViewMode::Continuous => {
                 // 平均页高（作为 show_rows 的行高，近似可见区）
-                let mut sum_h = 0.0f32;
+                let mut sum_h = 0.0;
                 for p in 0..page_count {
-                    sum_h += self.tabs[i].doc.page_size_pt(p).1;
+                    sum_h += tab.doc.page_size_pt(p).1;
                 }
                 let avg_h = sum_h / page_count.max(1) as f32 * px_per_pt / ppp;
                 let row_h = avg_h + gap;
 
                 let mut scroll = ScrollArea::vertical().id_salt("doc").auto_shrink([false, false]);
+                let mut jumped = false;
                 if let Some(p) = self.scroll_target.take() {
                     scroll = scroll.vertical_scroll_offset(p as f32 * row_h);
+                    jumped = true;
                 }
 
+                // 记录可见行范围的首行，滚动浏览时同步当前页（状态栏跟随）
+                let mut first_visible: Option<usize> = None;
                 scroll.show_rows(ui, row_h, page_count, |ui, range| {
+                    first_visible = Some(range.start);
                     for p in range {
-                        let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
+                        let (w_pt, h_pt) = tab.doc.page_size_pt(p);
                         let w = w_pt * px_per_pt / ppp;
                         let h = h_pt * px_per_pt / ppp;
                         // 请求渲染（未缓存/未在途才发送）
-                        self.tabs[i].request_render(p, zoom);
+                        tab.request_render(p, zoom);
                         ui.allocate_ui_with_layout(
                             Vec2::new(avail_w, h),
                             Layout::centered_and_justified(egui::Direction::LeftToRight),
                             |ui| {
-                                if let Some(tid) = self.tabs[i].display_texture_for(p) {
+                                if let Some(tid) = tab.display_texture_for(p) {
                                     ui.image(SizedTexture::new(tid, Vec2::new(w, h)));
                                 } else {
                                     ui.allocate_space(Vec2::new(w, h));
@@ -619,27 +561,51 @@ impl SmartPdfApp {
                         ui.add_space(gap);
                     }
                 });
+                // 滚动浏览时同步当前页；跳页那一帧除外，避免覆盖刚设置的页码
+                if !jumped {
+                    if let Some(p) = first_visible {
+                        let p = p.min(page_count.saturating_sub(1));
+                        if p != tab.page {
+                            tab.page = p;
+                        }
+                    }
+                }
             }
         }
     }
 
     // ---- 底部状态栏 ----
 
+    /// 状态栏：左侧固定两个信息槽（页码 / 缩放），右侧放状态消息或打开指引。
+    /// 恒定行高、等距槽位，避免消息出现/消失时高度跳动或排版不齐。
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let Some(i) = self.active_idx() else {
-            return;
-        };
-        let page = self.tabs[i].page;
-        let count = self.tabs[i].doc.page_count;
-        let zoom_pct = (self.tabs[i].zoom * 100.0).round() as i32;
-        ui.horizontal(|ui| {
-            ui.label(format!("页 {}/{}", page + 1, count));
-            ui.separator();
-            ui.label(format!("缩放 {zoom_pct}%"));
-            if !self.status.is_empty() {
-                ui.separator();
-                ui.label(&self.status);
+        let dim = ui.visuals().weak_text_color();
+        let info = |t: String| egui::RichText::new(t).small().color(dim);
+        // 先快照要显示的内容，避免闭包借用冲突
+        let (left, right) = match self.tab.as_ref() {
+            Some(t) => {
+                let zoom_pct = (t.zoom * 100.0).round() as i32;
+                (
+                    format!("页 {} / {}", t.page + 1, t.doc.page_count),
+                    format!("缩放 {zoom_pct}%"),
+                )
             }
+            None => ("未打开文档".to_string(), String::new()),
+        };
+        let hint = if self.tab.is_none() {
+            "⌘O 打开文档，或把文件拖进窗口"
+        } else {
+            self.status.as_str()
+        };
+        ui.horizontal(|ui| {
+            ui.label(info(left));
+            ui.add_space(14.0);
+            ui.label(info(right));
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                if !hint.is_empty() {
+                    ui.label(info(hint.to_string()));
+                }
+            });
         });
     }
 
@@ -666,15 +632,21 @@ impl SmartPdfApp {
         }
 
         let cmd = Modifiers::COMMAND;
-        // 进入演示：⌘P
-        if ctx.input_mut(|i| i.consume_key(cmd, Key::P)) {
+        // 进入演示：⌘P / F5
+        if ctx.input_mut(|i| i.consume_key(cmd, Key::P))
+            || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F5))
+        {
             self.start_presentation(ctx);
+        }
+        // 收起/展开缩略图侧栏：F9（菜单「视图 → 缩略图面板」同快捷键）
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F9)) {
+            self.toggle_thumbs();
         }
         if ctx.input_mut(|i| i.consume_key(cmd, Key::O)) {
             self.pick_and_open();
         }
         if ctx.input_mut(|i| i.consume_key(cmd, Key::W)) {
-            self.close_active();
+            self.close_doc();
         }
         if ctx.input_mut(|i| i.consume_key(cmd, Key::Equals)) || ctx.input_mut(|i| i.consume_key(cmd, Key::Plus)) {
             self.zoom(1.25);
@@ -711,7 +683,7 @@ impl SmartPdfApp {
         for cmd in crate::sysmenu::take() {
             match cmd {
                 crate::sysmenu::SysCmd::Open => self.pick_and_open(),
-                crate::sysmenu::SysCmd::Close => self.close_active(),
+                crate::sysmenu::SysCmd::Close => self.close_doc(),
                 crate::sysmenu::SysCmd::Prev => self.navigate(-1),
                 crate::sysmenu::SysCmd::Next => self.navigate(1),
                 crate::sysmenu::SysCmd::First => self.goto(0),
@@ -724,6 +696,7 @@ impl SmartPdfApp {
                 crate::sysmenu::SysCmd::Single => self.view_mode = ViewMode::Single,
                 crate::sysmenu::SysCmd::Continuous => self.view_mode = ViewMode::Continuous,
                 crate::sysmenu::SysCmd::Presentation => self.start_presentation(ctx),
+                crate::sysmenu::SysCmd::ToggleThumbs => self.toggle_thumbs(),
             }
         }
     }
@@ -731,7 +704,7 @@ impl SmartPdfApp {
     // ---- 演示模式（类 PPT） ----
 
     fn start_presentation(&mut self, ctx: &egui::Context) {
-        if self.active_idx().is_none() {
+        if self.tab.is_none() {
             return;
         }
         self.presenting = true;
@@ -745,14 +718,14 @@ impl SmartPdfApp {
 
     /// 演示面板：黑底 + 当前页等比适配全屏 + 页码指示。
     fn presentation_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(i) = self.active_idx() else {
+        let Some(tab) = self.tab.as_mut() else {
             // 无文档时退出演示
             self.exit_presentation(ui.ctx());
             return;
         };
-        let page = self.tabs[i].page;
-        let page_count = self.tabs[i].doc.page_count;
-        let (pw, ph) = self.tabs[i].doc.page_size_pt(page);
+        let page = tab.page;
+        let page_count = tab.doc.page_count;
+        let (pw, ph) = tab.doc.page_size_pt(page);
         if pw <= 0.0 || ph <= 0.0 {
             return;
         }
@@ -763,14 +736,14 @@ impl SmartPdfApp {
         let disp_w = pw * scale;
         let disp_h = ph * scale;
 
-        // 高清渲染缩放：渲染像素 ≈ 显示像素
-        let ppp = ui.ctx().pixels_per_point();
-        let pres_zoom = ((disp_w * ppp) / pw / scale_px_per_pt(1.0)).clamp(0.1, 4.0);
+        // 高清渲染缩放：渲染像素 ≈ 显示像素（屏幕倍率由 request_render 统一乘入，
+        // 这里只算逻辑比例，不再重复乘 ppp）
+        let pres_zoom = (disp_w / pw / scale_px_per_pt(1.0)).clamp(0.1, 4.0);
         // 预渲染当前页与相邻页（翻页时高清图已就绪，避免先模糊）
         let lo = page.saturating_sub(1);
         let hi = (page + 1).min(page_count.saturating_sub(1));
         for np in lo..=hi {
-            self.tabs[i].request_render(np, pres_zoom);
+            tab.request_render(np, pres_zoom);
         }
 
         // 黑底
@@ -778,7 +751,7 @@ impl SmartPdfApp {
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
 
         // 页面居中绘制：仅显示高清精确命中，不用低清缩略图拉伸（否则会模糊）
-        if let Some(tid) = self.tabs[i].texture_exact(page, pres_zoom) {
+        if let Some(tid) = tab.texture_exact(page, pres_zoom) {
             let top_left = egui::pos2(
                 rect.center().x - disp_w / 2.0,
                 rect.center().y - disp_h / 2.0,
@@ -800,8 +773,8 @@ impl SmartPdfApp {
             );
         }
 
-        // 页码指示（右下角）
-        let text = format!("{page} / {}", page_count + 1);
+        // 页码指示（右下角，1 基显示）
+        let text = format!("{} / {}", page + 1, page_count);
         ui.painter().text(
             egui::pos2(rect.right() - 20.0, rect.bottom() - 20.0),
             Align2::RIGHT_BOTTOM,
@@ -834,18 +807,39 @@ impl eframe::App for SmartPdfApp {
             crate::sysmenu::set_dock_icon();
             self.dock_icon_done = true;
         }
-        // 窗口已创建：把内容视图延伸到标题栏，标签栏与三色按钮同处一行
+        // 窗口已创建：把内容视图延伸到标题栏，内容行与三色按钮同处一行
         if !self.titlebar_done {
             crate::sysmenu::setup_unified_titlebar();
-            // 读取红按钮中心，使标签栏垂直对齐三色按钮（不同窗口样式高度不同）
+            // 读取红按钮中心，使标题栏内容垂直对齐三色按钮（不同窗口样式高度不同）
             let cy = crate::sysmenu::titlebar_button_center_y();
-            self.titlebar_tab_top = (cy - TAB_H / 2.0).max(0.0);
+            self.titlebar_top = (cy - TITLEBAR_H / 2.0).max(0.0);
             self.titlebar_done = true;
         }
         self.titlebar_double_consumed = false;
+
+        // 屏幕倍率同步：多显示器分辨率/倍率不同，换屏时按新倍率渲染
+        //（缓存 key 含倍率，旧倍率纹理自然过期淘汰，无需手动清缓存）
+        let ppp = ctx.pixels_per_point();
+        if let Some(t) = self.tab.as_mut() {
+            t.set_pixel_ratio(ppp);
+        }
+
         self.poll(&ctx);
         self.poll_sys_commands(&ctx);
         self.handle_shortcuts(&ctx);
+
+        // 拖放打开：winit 的 DroppedFile 事件只出现在当帧的 raw.dropped_files 里，
+        // 支持一次拖入多个文件（单文档模型下依次替换，最后者生效）。
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect()
+        });
+        for path in dropped {
+            self.open_path(&path);
+        }
 
         if self.presenting {
             // 演示模式：全屏单页（类 PPT）
@@ -853,18 +847,21 @@ impl eframe::App for SmartPdfApp {
             return;
         }
 
-        // 窗口内不再放菜单栏：菜单在 macOS 系统菜单栏（见 sysmenu.rs）
-        // 标签栏充当标题栏：左/右留 8px，顶部留白使标签垂直对齐三色按钮中心
-        let titlebar_tab_top = self.titlebar_tab_top;
-        let panel_resp = egui::Panel::top("tabs")
-            .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+        // ---- 窗口骨架 ----
+        // 标题栏 / 侧栏 / 状态栏同用一层「chrome 底色」，与中央正文区拉开层次；
+        // 分割线统一在所有面板之后绘制（后画的面板填充不会覆盖它们）。
+        let fill = panel_fill(ui);
+        let line = hairline(ui);
+        let top = self.titlebar_top;
+        let panel_resp = egui::Panel::top("titlebar")
+            .frame(egui::Frame::NONE.fill(fill).inner_margin(egui::Margin {
                 left: 8,
                 right: 8,
-                top: titlebar_tab_top as i8,
+                top: top as i8,
                 bottom: 0,
             }))
-            .show(ui, |ui| self.tabs_panel(ui));
-        // 双击标题栏空白处放大（egui 无 any_double_click，这里手动检测 500ms 内两次单击）
+            .show(ui, |ui| self.titlebar_panel(ui));
+        // 双击标题栏空白处放大（egui 无 any_double_click，手动检测 500ms 内两次单击）
         let now = ctx.input(|i| i.time);
         let clicked = ctx.input(|i| i.pointer.any_click());
         let click_pos = ctx.input(|i| i.pointer.interact_pos());
@@ -879,18 +876,53 @@ impl eframe::App for SmartPdfApp {
                         self.titlebar_dbl_pos = p;
                     }
                 } else {
-                    // 点在标签/按钮上：重置计时，避免与标题栏双击串扰
+                    // 点在按钮上：重置计时，避免与标题栏双击串扰
                     self.titlebar_dbl_time = -1.0;
                 }
             }
         }
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("thumbnails")
-            .resizable(true)
-            .default_size(170.0)
-            .min_size(110.0)
-            .show(ui, |ui| self.thumb_panel(ui));
+        // 底部状态栏：同 chrome 底色，恒定高度
+        let status_rect = egui::Panel::bottom("status")
+            .frame(
+                egui::Frame::NONE.fill(fill).inner_margin(egui::Margin {
+                    left: 10,
+                    right: 10,
+                    top: 5,
+                    bottom: 5,
+                }),
+            )
+            .show(ui, |ui| self.status_bar(ui))
+            .response
+            .rect;
+
+        // 左侧缩略图侧栏：展开时可拖宽；收起时完全隐藏（标题栏按钮 / F9 展开）
+        let thumbs_rect = if self.show_thumbs {
+            Some(
+                egui::Panel::left("thumbnails")
+                    .resizable(true)
+                    .default_size(170.0)
+                    .min_size(110.0)
+                    .frame(
+                        egui::Frame::NONE.fill(fill).inner_margin(egui::Margin::symmetric(6, 6)),
+                    )
+                    .show(ui, |ui| self.thumb_panel(ui))
+                    .response
+                    .rect,
+            )
+        } else {
+            None
+        };
         egui::CentralPanel::default().show(ui, |ui| self.doc_panel(ui));
+
+        // 发丝分割线（在所有面板绘制之后画，避免被后画面板的填充覆盖）：
+        // 标题栏下缘横线、侧栏右缘竖线（与标题栏横线端点对齐相接）、状态栏上缘横线。
+        let tb = panel_resp.response.rect;
+        ui.painter().hline(tb.x_range(), tb.bottom(), line);
+        if let Some(tr) = thumbs_rect {
+            ui.painter().vline(tr.right(), tr.y_range(), line);
+        }
+        ui.painter()
+            .hline(status_rect.x_range(), status_rect.top(), line);
     }
 }
 
@@ -916,4 +948,39 @@ fn setup_cjk_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 适应宽度吸附：接近标准档位时向下取整；差距过大保持精确适配。
+    #[test]
+    fn fit_zoom_snaps_down_to_steps() {
+        assert_eq!(snap_fit_zoom(1.09), 1.0);
+        assert_eq!(snap_fit_zoom(1.30), 1.25);
+        assert_eq!(snap_fit_zoom(1.62), 1.5);
+        assert_eq!(snap_fit_zoom(2.04), 2.0);
+        // 0.96 比下方档位（0.75）大太多、又够不到 1.0：保持精确值
+        assert_eq!(snap_fit_zoom(0.96), 0.96);
+        assert_eq!(snap_fit_zoom(1.9), 1.9);
+    }
+
+    /// 手动缩放吸附：±6% 以内就近落档位，否则保持。
+    #[test]
+    fn nearest_snap_for_manual_zoom() {
+        assert_eq!(snap_zoom_nearest(1.28), 1.25);
+        assert_eq!(snap_zoom_nearest(0.74), 0.75);
+        assert_eq!(snap_zoom_nearest(2.05), 2.0);
+        assert_eq!(snap_zoom_nearest(1.13), 1.13);
+        assert_eq!(snap_zoom_nearest(0.05), 0.05);
+    }
+
+    /// 标题去扩展名（标题栏居中显示文件名用）。
+    #[test]
+    fn strips_extension_for_title() {
+        assert_eq!(strip_extension("demo.pdf"), "demo");
+        assert_eq!(strip_extension("v1.2 报告"), "v1.2 报告");
+        assert_eq!(strip_extension("无扩展名"), "无扩展名");
+    }
 }

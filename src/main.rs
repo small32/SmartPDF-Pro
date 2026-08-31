@@ -18,6 +18,8 @@ fn main() {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 800.0])
+            // 小屏幕（如 1366×768 的笔记本）上允许缩到可用尺寸
+            .with_min_inner_size([680.0, 460.0])
             // 窗口标题留空：macOS 系统菜单栏已显示 App 名，
             // 标题栏再显示一次会造成重复。
             .with_title("")
