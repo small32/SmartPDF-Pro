@@ -32,7 +32,7 @@ for sz in 16 32 128 256 512; do
 done
 iconutil -c icns target/AppIcon.iconset -o target/AppIcon.icns
 
-echo "==> 3/4 组装应用包"
+echo "==> 3/5 组装应用包"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/$EXE"
@@ -40,6 +40,10 @@ cp target/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp packaging/Info.plist "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
-echo "==> 4/4 完成"
+echo "==> 4/5 自签名（ad-hoc，无需证书，满足 Gatekeeper 本地校验）"
+codesign --force --deep --sign - "$APP"
+codesign --verify --verbose=2 "$APP"
+
+echo "==> 5/5 完成"
 echo "构建产物：$(pwd)/$APP"
 echo "启动方式：open \"$APP\""
