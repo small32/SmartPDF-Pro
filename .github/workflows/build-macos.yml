@@ -8,6 +8,10 @@ on:
   pull_request:
     branches: [master]
 
+# 默认 GITHUB_TOKEN 为只读，创建 Release 需要显式授予写入权限
+permissions:
+  contents: write
+
 jobs:
   build-macos:
     name: Build SmartPDF Pro (.app)
