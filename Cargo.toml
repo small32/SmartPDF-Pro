@@ -1,6 +1,6 @@
 [package]
 name = "smartpdf-pro"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "SmartPDF Pro - 面向 macOS 的轻量多格式阅读器（PDF/EPUB/CBZ 等）"
 
@@ -22,6 +22,9 @@ rfd = "0.15"
 env_logger = "0.11"
 log = "0.4"
 image = "0.25.10"
+objc2-core-text = "0.3.2"
+objc2-core-foundation = "0.3.2"
+ab_glyph = "0.2.32"
 
 # mupdf 是巨型 C 代码，debug 模式下也关掉 debug 信息以显著加快增量编译
 [profile.dev]

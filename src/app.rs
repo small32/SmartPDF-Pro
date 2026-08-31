@@ -14,6 +14,12 @@ use eframe::egui::{
     ScrollArea, Vec2,
 };
 use eframe::egui::load::SizedTexture;
+// CoreText：枚举系统字体供「设置」选择；ab_glyph 校验所选字体可渲染
+use objc2_core_foundation::{CFString, CFURL, CFURLPathStyle};
+use objc2_core_text::{
+    CTFont, CTFontManagerCopyAvailableFontFamilyNames, CTFontManagerCopyAvailableFontURLs,
+    kCTFontURLAttribute,
+};
 
 use crate::document::scale_px_per_pt;
 use crate::tab::DocTab;
@@ -255,13 +261,21 @@ pub struct SmartPdfApp {
     titlebar_dbl_pos: egui::Pos2,
     /// 上一帧视口尺寸：用于检测窗口缩放/拖拽，主动触发重绘避免标签栏滞后。
     last_viewport: egui::Vec2,
+    /// 「设置」窗口是否打开。
+    show_settings: bool,
+    /// 用户选择的界面字体文件路径（None = 系统默认）。
+    ui_font: Option<String>,
+    /// 字体设置窗口中「待确认」的选择（跨帧保留）：
+    /// Some(Some(path)) = 选了某字体；Some(None) = 选了系统默认；None = 尚未点选。
+    settings_pending: Option<Option<String>>,
 }
 
 impl SmartPdfApp {
     pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
-        setup_cjk_fonts(&cc.egui_ctx);
         // 原生系统菜单栏（动作经 channel 转发给本 App）
         crate::sysmenu::init_channel();
+        let saved_font = load_font_config();
+        setup_cjk_fonts(&cc.egui_ctx, saved_font.as_deref());
         // 注册 egui 上下文，供原生 resize 回调在实时缩放时强制重绘
         crate::sysmenu::set_context(cc.egui_ctx.clone());
         crate::sysmenu::install();
@@ -279,6 +293,9 @@ impl SmartPdfApp {
             titlebar_dbl_time: -1.0,
             titlebar_dbl_pos: egui::Pos2::ZERO,
             last_viewport: egui::Vec2::ZERO,
+            show_settings: false,
+            ui_font: saved_font,
+            settings_pending: None,
         };
         for f in files {
             app.open_path(&f);
@@ -346,6 +363,20 @@ impl SmartPdfApp {
     // ---- 顶部标签栏 ----
 
     fn tabs_panel(&mut self, ui: &mut egui::Ui) {
+        // 标题栏区域（整条标签栏）支持拖动窗口：空白处按住拖动 → 触发原生窗口拖动。
+        // 由于子组件（标签/＋按钮）绘制在交互层之上会优先响应，因此只有空白区域
+        // 的拖动才会落到这里，设置窗口、滚动条、标签、按钮的拖动互不干扰。
+        // 原实现用 NSWindow.setMovableByWindowBackground(true) 让整窗可拖动，
+        // 导致拖动设置窗口/滚动条时整个窗体跟着移动，已移除（见 sysmenu.rs）。
+        let drag_resp = ui.interact(
+            ui.max_rect(),
+            ui.id().with("titlebar_drag"),
+            egui::Sense::drag(),
+        );
+        if drag_resp.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+
         // 强制标签栏行高恒定为 TAB_H：有文档时行高由 tab_item 撑满为 28，
         // 但无文档时面板里仅剩「＋」按钮，行高会退化为按钮自然高度（更矮），
         // 导致整条栏相对三色按钮中心上偏错位。统一行高可让两者始终垂直对齐。
@@ -648,17 +679,28 @@ impl SmartPdfApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         // ---- 演示模式快捷键 ----
         if self.presenting {
-            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            // 退出：Esc 或 ⌘句点 (.)
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+                || ctx.input_mut(|i| {
+                    i.consume_key(Modifiers::COMMAND, Key::Period)
+                })
+            {
                 self.exit_presentation(ctx);
             }
-            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowRight))
-                || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Space))
+            // 下一页/下一个动画：N / PageDown / 向右 / 向下 / 空格
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::N))
                 || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::PageDown))
+                || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowRight))
+                || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown))
+                || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Space))
             {
                 self.navigate(1);
             }
-            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft))
+            // 上一页/返回上一个动画：P / PageUp / 向左 / 向上
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::P))
                 || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::PageUp))
+                || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft))
+                || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp))
             {
                 self.navigate(-1);
             }
@@ -666,9 +708,14 @@ impl SmartPdfApp {
         }
 
         let cmd = Modifiers::COMMAND;
-        // 进入演示：⌘P
-        if ctx.input_mut(|i| i.consume_key(cmd, Key::P)) {
+        // 进入演示：⌘Return 从当前页；⇧⌘Return 从头开始
+        if ctx.input_mut(|i| i.consume_key(cmd, Key::Enter)) {
             self.start_presentation(ctx);
+        }
+        if ctx.input_mut(|i| {
+            i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Enter)
+        }) {
+            self.start_presentation_from_beginning(ctx);
         }
         if ctx.input_mut(|i| i.consume_key(cmd, Key::O)) {
             self.pick_and_open();
@@ -724,6 +771,10 @@ impl SmartPdfApp {
                 crate::sysmenu::SysCmd::Single => self.view_mode = ViewMode::Single,
                 crate::sysmenu::SysCmd::Continuous => self.view_mode = ViewMode::Continuous,
                 crate::sysmenu::SysCmd::Presentation => self.start_presentation(ctx),
+                crate::sysmenu::SysCmd::PresentationFromBeginning => {
+                    self.start_presentation_from_beginning(ctx)
+                }
+                crate::sysmenu::SysCmd::Settings => self.show_settings = true,
             }
         }
     }
@@ -736,6 +787,15 @@ impl SmartPdfApp {
         }
         self.presenting = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+    }
+
+    /// 从头开始放映：跳转到首页再进入演示模式。
+    fn start_presentation_from_beginning(&mut self, ctx: &egui::Context) {
+        if self.active_idx().is_none() {
+            return;
+        }
+        self.goto(0);
+        self.start_presentation(ctx);
     }
 
     fn exit_presentation(&mut self, ctx: &egui::Context) {
@@ -891,12 +951,66 @@ impl eframe::App for SmartPdfApp {
             .min_size(110.0)
             .show(ui, |ui| self.thumb_panel(ui));
         egui::CentralPanel::default().show(ui, |ui| self.doc_panel(ui));
+
+        // 设置窗口（菜单栏「设置… ⌘,」打开）
+        if self.show_settings {
+            self.settings_window(&ctx);
+        }
     }
 }
 
-/// 加载系统 CJK 字体作为 fallback，保证中文界面正常显示。
-fn setup_cjk_fonts(ctx: &egui::Context) {
+/// 加载界面字体：优先使用用户选择的字体（`font_path`），否则用系统 CJK 字体兜底。
+///
+/// 选择的字体经 [`font_is_renderable`] 校验可渲染后才会应用，避免所选字体（如系统保留
+/// 字体）无法渲染导致整个界面文字消失。始终保留默认 CJK 字体作为 fallback。
+fn setup_cjk_fonts(ctx: &egui::Context, font_path: Option<&str>) {
     let mut fonts = FontDefinitions::default();
+
+    // 首选界面字体：用户自选字体优先；否则用系统自带的苹方作为默认。
+    // 均经 font_is_renderable 校验，避免所选字体无法渲染导致整个界面文字消失。
+    let mut applied = false;
+    if let Some(path) = font_path {
+        if let Ok(bytes) = std::fs::read(path) {
+            if font_is_renderable(&bytes) {
+                fonts
+                    .font_data
+                    .insert("ui".into(), Arc::new(FontData::from_owned(bytes)));
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "ui".into());
+                log::info!("已应用界面字体：{path}");
+                applied = true;
+            } else {
+                log::warn!("所选字体无法渲染，忽略：{path}");
+            }
+        }
+    }
+    if !applied {
+        // 默认：macOS 自带的苹方（PingFang.ttc），运行时从系统读取，不内嵌
+        if let Some(path) = find_system_pingfang() {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if font_is_renderable(&bytes) {
+                    fonts
+                        .font_data
+                        .insert("ui".into(), Arc::new(FontData::from_owned(bytes)));
+                    fonts
+                        .families
+                        .entry(egui::FontFamily::Proportional)
+                        .or_default()
+                        .insert(0, "ui".into());
+                    log::info!("已应用系统苹方字体：{path}");
+                } else {
+                    log::warn!("系统苹方无法渲染，跳过：{path}");
+                }
+            }
+        } else {
+            log::warn!("未找到系统苹方字体，使用系统 CJK 兜底");
+        }
+    }
+
+    // 系统 CJK 字体兜底
     let candidates = [
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/System/Library/Fonts/STHeiti Medium.ttc",
@@ -916,4 +1030,295 @@ fn setup_cjk_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// 校验字体数据确实可渲染（ab_glyph 能解析出至少一个常用字符的字形）。
+///
+/// egui 底层用 ab_glyph 解析字体；系统「保留字体」（如 PingFangUI 等以 `.` 开头的
+/// 字体）能被解析但无实际字形，会让界面文字全部消失。这里用 ab_glyph 预检，
+/// 确保所选字体至少能渲染出字母与汉字。
+fn font_is_renderable(bytes: &[u8]) -> bool {
+    use ab_glyph::{Font, FontArc};
+    let Ok(font) = FontArc::try_from_vec(bytes.to_vec()) else {
+        return false;
+    };
+    // 检查常见字符是否有字形：拉丁字母、数字、中文
+    let probes = ['A', '1', '中'];
+    probes.iter().any(|c| font.glyph_id(*c).0 != 0)
+}
+
+/// 枚举系统字体：返回 (家族名, 文件路径) 列表。
+///
+/// 直接用 `CTFontManagerCopyAvailableFontFamilyNames` 拿干净的家族名，再用
+/// `CTFont` 的 URL 属性定位字体文件。过滤掉：
+/// - 系统保留字体（家族名以 `.` 开头，如 `.PingFang UI SC`，无实际字形不可渲染）
+/// - name 表异常的乱码家族名（含 NUL / 替换字符）
+fn list_system_fonts() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    unsafe {
+        let families = CTFontManagerCopyAvailableFontFamilyNames();
+        let count = families.count();
+        for i in 0..count {
+            let ptr = families.value_at_index(i);
+            if ptr.is_null() {
+                continue;
+            }
+            let cf = &*(ptr as *const CFString);
+            let name = cf.to_string();
+            // 跳过保留字体与乱码
+            if name.is_empty()
+                || name.starts_with('.')
+                || name.contains('\0')
+                || name.contains('\u{FFFD}')
+            {
+                continue;
+            }
+            // 家族名 → 字体文件路径
+            if let Some(path) = family_path(&name) {
+                out.push((name, path));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out.dedup_by(|a, b| a.1 == b.1);
+    out
+}
+
+/// 家族名 → 字体文件路径（经 `CTFont` 的 URL 属性）。
+fn family_path(family: &str) -> Option<String> {
+    unsafe {
+        let cf_name = CFString::from_str(family);
+        let font = CTFont::with_name(&cf_name, 12.0, std::ptr::null());
+        let attr = font.attribute(&kCTFontURLAttribute)?;
+        let url = attr.downcast_ref::<CFURL>()?;
+        let cf_path = url.file_system_path(CFURLPathStyle::CFURLPOSIXPathStyle)?;
+        let path = cf_path.to_string();
+        if path.is_empty() {
+            return None;
+        }
+        Some(path)
+    }
+}
+
+/// 定位系统自带的苹方字体文件（PingFang.ttc）。
+///
+/// 注意：不能用 `family_path("PingFang SC")`——它解析到的是 `PingFangUI.ttc`，
+/// 其首个字体是系统保留字体 `.PingFangUITextSC-Regular`，ab_glyph 无法渲染，
+/// 会导致整个界面文字消失。因此这里直接枚举系统字体文件，找文件名恰为
+/// `PingFang.ttc` 的（位于 AssetsV2 缓存），其首个字体 PingFangHK-Regular 可渲染。
+fn find_system_pingfang() -> Option<String> {
+    unsafe {
+        let urls = CTFontManagerCopyAvailableFontURLs();
+        let count = urls.count();
+        for i in 0..count {
+            let ptr = urls.value_at_index(i);
+            if ptr.is_null() {
+                continue;
+            }
+            let url = &*(ptr as *const CFURL);
+            let Some(cf_path) = url.file_system_path(CFURLPathStyle::CFURLPOSIXPathStyle) else {
+                continue;
+            };
+            let path = cf_path.to_string();
+            if path.ends_with("PingFang.ttc") {
+                return Some(path);
+            }
+        }
+        None
+    }
+}
+
+// ---- 设置窗口 ----
+
+impl SmartPdfApp {
+    /// 渲染「字体设置」窗口：界面字体选择（点选暂存到 self.settings_pending，点「确认」才应用）。
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        // 底部按钮动作
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let current = self.ui_font.clone();
+        // 显示用：待确认的选择优先（若尚未点选则显示当前生效字体）
+        let display: Option<String> = self
+            .settings_pending
+            .clone()
+            .unwrap_or_else(|| current.clone());
+
+        egui::Window::new("字体设置")
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(380.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    ui.heading("字体设置");
+                    ui.label("默认使用 macOS 自带苹方（PingFang）；也可选择其他系统字体：");
+                    ui.add_space(6.0);
+
+                    let fonts = list_system_fonts();
+
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            // 「默认」选项：使用系统苹方
+                            let is_default = display.is_none();
+                            if ui
+                                .selectable_label(is_default, "默认（系统苹方 PingFang）")
+                                .clicked()
+                            {
+                                self.settings_pending = Some(None);
+                            }
+                            // 各系统字体
+                            for (name, path) in &fonts {
+                                let selected = display.as_deref() == Some(path.as_str());
+                                if ui.selectable_label(selected, name).clicked() {
+                                    self.settings_pending = Some(Some(path.clone()));
+                                }
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("当前：");
+                        ui.label(
+                            display.as_deref().unwrap_or("默认（系统苹方 PingFang）"),
+                        );
+                    });
+                    ui.add_space(6.0);
+                    // 确认/取消：点选已存到 self.settings_pending，这里记录按钮动作
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("确认").clicked() {
+                                confirmed = true;
+                            }
+                            if ui.button("取消").clicked() {
+                                cancelled = true;
+                            }
+                        });
+                    });
+                });
+            });
+
+        // 点「确认」才应用并持久化；点「取消」或直接关闭则放弃（不改当前字体）
+        if confirmed {
+            if let Some(new_font) = self.settings_pending.take() {
+                self.apply_ui_font(ctx, new_font.as_deref());
+                save_font_config(new_font.as_deref());
+            }
+            self.settings_pending = None;
+            self.show_settings = false;
+        } else if cancelled {
+            // 放弃待确认选择，保持当前字体；关闭窗口
+            self.settings_pending = None;
+            self.show_settings = false;
+        } else {
+            // 用户还没点确认/取消：保持窗口打开（除非用户点了 × 关闭，此时 open 已被置 false）
+            if !open {
+                self.settings_pending = None;
+            }
+            self.show_settings = open;
+        }
+    }
+
+    /// 应用界面字体并持久化。
+    fn apply_ui_font(&mut self, ctx: &egui::Context, path: Option<&str>) {
+        self.ui_font = path.map(|p| p.to_string());
+        setup_cjk_fonts(ctx, path);
+    }
+}
+
+/// 字体偏好配置文件路径。
+fn font_config_path() -> PathBuf {
+    let dir = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(dir)
+        .join("Library/Application Support/SmartPDF Pro")
+        .join("font.conf")
+}
+
+/// 读取保存的字体偏好。
+fn load_font_config() -> Option<String> {
+    let path = font_config_path();
+    let s = std::fs::read_to_string(&path).ok()?;
+    let s = s.trim().to_string();
+    if s.is_empty() || !Path::new(&s).exists() {
+        return None;
+    }
+    Some(s)
+}
+
+/// 保存字体偏好（None 表示系统默认，删除配置）。
+fn save_font_config(path: Option<&str>) {
+    let file = font_config_path();
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match path {
+        Some(p) => {
+            let _ = std::fs::write(&file, p);
+        }
+        None => {
+            let _ = std::fs::remove_file(&file);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{family_path, find_system_pingfang, font_is_renderable, list_system_fonts};
+
+    #[test]
+    fn enumerates_system_fonts() {
+        let fonts = list_system_fonts();
+        assert!(!fonts.is_empty(), "应能枚举出系统字体");
+        // 至少应包含苹方/冬青等中文字体家族
+        let has_cjk = fonts.iter().any(|(name, _)| {
+            name.contains("PingFang")
+                || name.contains("苹方")
+                || name.contains("Hiragino")
+                || name.contains("Heiti")
+        });
+        assert!(has_cjk, "应能找到中文字体家族");
+        println!(
+            "枚举到 {} 个字体，示例：{:?}",
+            fonts.len(),
+            &fonts[..3.min(fonts.len())]
+        );
+    }
+
+    #[test]
+    fn font_family_lookup_works() {
+        // Hiragino 家族名应能定位到其字体文件
+        let path = family_path("Hiragino Sans GB");
+        assert!(path.is_some(), "应能定位 Hiragino Sans GB 的字体文件");
+        println!("Hiragino 字体文件: {path:?}");
+    }
+
+    #[test]
+    fn renderable_check_rejects_garbage() {
+        // 垃圾字节不应被认为可渲染
+        assert!(!font_is_renderable(b"not a font at all"));
+        // 真实字体应可渲染
+        let bytes = std::fs::read("/System/Library/Fonts/Hiragino Sans GB.ttc").unwrap();
+        assert!(font_is_renderable(&bytes), "Hiragino 应可渲染");
+    }
+
+    #[test]
+    fn system_pingfang_is_renderable() {
+        // 系统自带苹方应能被定位且可渲染（否则界面文字会消失）
+        let path = find_system_pingfang()
+            .expect("macOS 应自带苹方字体 PingFang.ttc");
+        let bytes = std::fs::read(&path).expect("应能读取苹方字体文件");
+        assert!(
+            font_is_renderable(&bytes),
+            "系统苹方应可渲染：{path}"
+        );
+        println!("系统苹方: {path}");
+    }
+
+    #[test]
+    fn diag_kingsoft_family() {
+        let name = family_path("Kingsoft UE");
+        println!("Kingsoft UE 诊断: {name:?}");
+    }
 }

@@ -17,9 +17,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, Sel};
 use objc2::{MainThreadOnly, MainThreadMarker};
 use objc2_app_kit::{
-    NSAnimationContext, NSApplication, NSImage, NSMenuItem, NSMenu, NSScreen, NSWindowButton,
-    NSWindowDidEndLiveResizeNotification, NSWindowDidResizeNotification, NSWindowStyleMask,
-    NSWindowTitleVisibility, NSWindowWillStartLiveResizeNotification,
+    NSEventModifierFlags, NSAnimationContext, NSApplication, NSImage, NSMenuItem, NSMenu, NSScreen,
+    NSWindowButton, NSWindowDidEndLiveResizeNotification, NSWindowDidResizeNotification,
+    NSWindowStyleMask, NSWindowTitleVisibility, NSWindowWillStartLiveResizeNotification,
 };
 use objc2_foundation::{NSData, NSNotificationCenter, NSPoint, NSRect, NSSize, NSString};
 
@@ -41,7 +41,12 @@ pub enum SysCmd {
     FitWidth,
     Single,
     Continuous,
+    /// 从当前页开始放映（⌘Return）。
     Presentation,
+    /// 从头开始放映（⇧⌘Return）。
+    PresentationFromBeginning,
+    /// 打开「设置」窗口（字体选择等）。
+    Settings,
 }
 
 static TX: OnceLock<Mutex<Sender<SysCmd>>> = OnceLock::new();
@@ -167,6 +172,16 @@ define_class!(
         fn start_presentation(&self, _sender: &AnyObject) {
             send(SysCmd::Presentation);
         }
+
+        #[unsafe(method(startPresentationFromBeginning:))]
+        fn start_presentation_from_beginning(&self, _sender: &AnyObject) {
+            send(SysCmd::PresentationFromBeginning);
+        }
+
+        #[unsafe(method(openSettings:))]
+        fn open_settings(&self, _sender: &AnyObject) {
+            send(SysCmd::Settings);
+        }
     }
 );
 
@@ -289,8 +304,9 @@ pub fn setup_unified_titlebar() {
         // 内容延伸到整窗（含标题栏区域）
         let mask = window.styleMask();
         window.setStyleMask(mask | NSWindowStyleMask::FullSizeContentView);
-        // 标题栏被内容占据后，允许拖动窗口背景来移动窗口
-        window.setMovableByWindowBackground(true);
+        // 注意：不再用 setMovableByWindowBackground(true) —— 那会让整个窗口背景都能拖动，
+        // 导致拖动「设置」窗口、滚动条时整个窗体跟着移动。窗口拖动改由 egui 在标签栏
+        // 区域检测后发 ViewportCommand::StartDrag（见 app.rs::tabs_panel）。
         // 实时缩放：开始/结束维护 LIVE_RESIZE 标志（ui() 据此连续重绘），
         // 每一步缩放也都请求一次重绘，避免内容被 Core Animation 拉伸后跳变
         unsafe {
@@ -387,7 +403,7 @@ pub fn install() {
     let app = NSApplication::sharedApplication(mtm);
     let menu_bar = NSMenu::new(mtm);
 
-    // 应用菜单（退出 ⌘Q / 关于）
+    // 应用菜单（关于 / 设置 / 退出）
     let app_menu = NSMenu::new(mtm);
     app_menu.addItem(&menu_item(
         mtm,
@@ -396,6 +412,7 @@ pub fn install() {
         "orderFrontStandardAboutPanel:",
         "",
     ));
+    app_menu.addItem(&menu_item(mtm, Some(&target), "字体设置…", "openSettings:", ","));
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     app_menu.addItem(&menu_item(mtm, None, "退出 SmartPDF Pro", "terminate:", "q"));
     menu_bar.addItem(&top_menu(mtm, "SmartPDF Pro", &app_menu));
@@ -415,7 +432,23 @@ pub fn install() {
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
     view_menu.addItem(&menu_item(mtm, Some(&target), "统一页宽", "toggleFitWidth:", ""));
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    view_menu.addItem(&menu_item(mtm, Some(&target), "演示  ⌘P", "startPresentation:", "p"));
+    // 演示：⌘↩ 从当前页；⇧⌘↩ 从头开始（Return 键的 keyEquivalent 是 "\r"）
+    view_menu.addItem(&menu_item_mods(
+        mtm,
+        Some(&target),
+        "从当前页开始放映  ⌘↩",
+        "startPresentation:",
+        "\r",
+        NSEventModifierFlags::Command,
+    ));
+    view_menu.addItem(&menu_item_mods(
+        mtm,
+        Some(&target),
+        "从头开始放映  ⇧⌘↩",
+        "startPresentationFromBeginning:",
+        "\r",
+        NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+    ));
     menu_bar.addItem(&top_menu(mtm, "视图", &view_menu));
 
     // 前往
@@ -458,6 +491,20 @@ fn menu_item(
     key: &str,
 ) -> Retained<NSMenuItem> {
     menu_item_tag(mtm, target, title, selector, key, 0)
+}
+
+/// 创建带自定义修饰键的菜单项（如 ⇧⌘ 组合快捷键）。
+fn menu_item_mods(
+    mtm: MainThreadMarker,
+    target: Option<&MenuTarget>,
+    title: &str,
+    selector: &str,
+    key: &str,
+    mods: NSEventModifierFlags,
+) -> Retained<NSMenuItem> {
+    let item = menu_item(mtm, target, title, selector, key);
+    item.setKeyEquivalentModifierMask(mods);
+    item
 }
 
 fn menu_item_tag(
