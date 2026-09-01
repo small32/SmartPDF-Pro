@@ -31,10 +31,6 @@ pub enum ViewMode {
     Continuous,
 }
 
-/// 缩略图渲染缩放（低分辨率小图，与正文缩放分开缓存）。
-const THUMB_ZOOM: f32 = 0.3;
-/// 缩略图显示宽度（逻辑点）。
-const THUMB_WIDTH: f32 = 108.0;
 const PAGE_GAP: f32 = 18.0;
 
 // ---- 标签条尺寸 ----
@@ -261,6 +257,8 @@ pub struct SmartPdfApp {
     titlebar_dbl_pos: egui::Pos2,
     /// 上一帧视口尺寸：用于检测窗口缩放/拖拽，主动触发重绘避免标签栏滞后。
     last_viewport: egui::Vec2,
+    /// 缩略图栏上次计算适应宽度时的面板宽度（用于避免每帧振荡重算）。
+    thumb_fit_width: f32,
     /// 「设置」窗口是否打开。
     show_settings: bool,
     /// 用户选择的界面字体文件路径（None = 系统默认）。
@@ -293,6 +291,7 @@ impl SmartPdfApp {
             titlebar_dbl_time: -1.0,
             titlebar_dbl_pos: egui::Pos2::ZERO,
             last_viewport: egui::Vec2::ZERO,
+            thumb_fit_width: 0.0,
             show_settings: false,
             ui_font: saved_font,
             settings_pending: None,
@@ -529,33 +528,50 @@ impl SmartPdfApp {
             return;
         };
         let page_count = self.tabs[i].doc.page_count;
+        let ppp = ui.ctx().pixels_per_point();
 
-        // 平均缩略图高度（作为 show_rows 行高，只渲染可见缩略图）
+        // 缩略图宽度封顶：最大 160px（即使栏再宽也不继续放大，居中显示）。
+        let cap = |w: f32| w.clamp(20.0, 160.0);
+
+        // 平均缩略图高度（作为 show_rows 行高，只渲染可见缩略图；用封顶后的宽度估算）
+        let est_w = cap(ui.available_width());
         let mut sum_h = 0.0f32;
         for p in 0..page_count {
             let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
-            sum_h += THUMB_WIDTH * h_pt / w_pt.max(0.01);
+            sum_h += est_w * h_pt / w_pt.max(0.01);
         }
         let row_h = sum_h / page_count.max(1) as f32 + 6.0;
 
         ScrollArea::vertical()
             .id_salt("thumbs")
             .show_rows(ui, row_h, page_count, |ui, range| {
+                // 实时可用宽度（封顶 320px）；栏再宽时保持 320 居中，不随栏继续放大。
+                // 渲染缩放用迟滞后的基准（>4px 才变），避免拖动时每帧重新渲染。
+                let live_w = cap(ui.available_width());
+                if (live_w - self.thumb_fit_width).abs() > 4.0 {
+                    self.thumb_fit_width = live_w;
+                }
+                let zoom_base = self.thumb_fit_width.max(20.0);
+
                 for p in range {
                     let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
-                    let h = THUMB_WIDTH * h_pt / w_pt.max(0.01);
+                    let h = live_w * h_pt / w_pt.max(0.01);
+                    // 自适应缩放：渲染缩放使页面宽度铺满 zoom_base（egui 点），含 ppp 修正
+                    let zoom =
+                        (zoom_base * ppp / (w_pt * scale_px_per_pt(1.0))).clamp(0.05, 8.0);
                     // 只对可见缩略图发起渲染请求
-                    self.tabs[i].request_render(p, THUMB_ZOOM);
-                    let panel_w = ui.available_width();
+                    self.tabs[i].request_render(p, zoom);
+                    // 行占满整栏宽，缩略图（封顶 320px）在其中居中显示
+                    let row_w = ui.available_width().max(20.0);
                     let resp = ui
                         .allocate_ui_with_layout(
-                            Vec2::new(panel_w, h),
+                            Vec2::new(row_w, h),
                             Layout::centered_and_justified(egui::Direction::LeftToRight),
                             |ui| {
-                                if let Some(tid) = self.tabs[i].display_texture_at(p, THUMB_ZOOM) {
-                                    ui.image(SizedTexture::new(tid, Vec2::new(THUMB_WIDTH, h)));
+                                if let Some(tid) = self.tabs[i].display_texture_at(p, zoom) {
+                                    ui.image(SizedTexture::new(tid, Vec2::new(live_w, h)));
                                 } else {
-                                    ui.allocate_space(Vec2::new(THUMB_WIDTH, h));
+                                    ui.allocate_space(Vec2::new(live_w, h));
                                 }
                             },
                         )
@@ -580,19 +596,20 @@ impl SmartPdfApp {
         let ppp = ctx.pixels_per_point();
         let avail_w = ui.available_width();
 
-        // 适应宽度：只在窗口宽度真实变化（>4px）时重算缩放。
-        // 若每帧用 available_width 重算，垂直滚动条出现/消失会让宽度微变 → zoom 振荡、
-        // 页面反复以不同缩放渲染（闪烁）。用 viewport 宽度做判据一次性更新。
+        // 适应宽度：以「文档区域宽度」avail_w 为基准（CentralPanel 已排除左侧缩略图栏），
+        // 只在宽度真实变化（>4px）时重算缩放。若每帧重算，垂直滚动条出现/消失会让宽度微变
+        // → zoom 振荡、页面反复以不同缩放渲染（闪烁）。用 avail_w 做判据一次性更新，
+        // 同时也能响应缩略图栏宽度变化。
+        //
+        // 缩放换算：显示宽度 = pw * scale_px_per_pt(zoom) / ppp（egui 点），
+        // 要填满 avail_w 需 zoom = avail_w * ppp / (pw * scale_px_per_pt(1.0))。
         {
             let tab = &mut self.tabs[i];
             if tab.fit_width {
-                let vw = ui
-                    .ctx()
-                    .input(|i| i.viewport().inner_rect.map(|r| r.width()).unwrap_or(0.0));
-                if (vw - tab.fit_width_viewport).abs() > 4.0 {
+                if (avail_w - tab.fit_width_viewport).abs() > 4.0 {
                     let (pw, _) = tab.page_size_pt();
-                    tab.zoom = (avail_w / (pw * scale_px_per_pt(1.0))).clamp(0.05, 8.0);
-                    tab.fit_width_viewport = vw;
+                    tab.zoom = (avail_w * ppp / (pw * scale_px_per_pt(1.0))).clamp(0.05, 8.0);
+                    tab.fit_width_viewport = avail_w;
                 }
             }
         }
@@ -949,6 +966,7 @@ impl eframe::App for SmartPdfApp {
             .resizable(true)
             .default_size(170.0)
             .min_size(110.0)
+            .max_size(200.0)
             .show(ui, |ui| self.thumb_panel(ui));
         egui::CentralPanel::default().show(ui, |ui| self.doc_panel(ui));
 

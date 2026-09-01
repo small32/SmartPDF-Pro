@@ -71,7 +71,7 @@ pub struct DocTab {
     pub zoom: f32,
     /// 是否处于"适应宽度"模式。
     pub fit_width: bool,
-    /// 上次计算 fit_width 时的 viewport 宽度（用于避免每帧振荡重算）。
+    /// 上次计算 fit_width 时的文档区域宽度（用于避免每帧振荡重算；不含左侧缩略图栏）。
     pub fit_width_viewport: f32,
     /// 多页渲染缓存，缓存页数上限见 [`Self::CACHE_LIMIT`]。
     caches: HashMap<RenderKey, CachedPage>,
