@@ -1,10 +1,9 @@
 #!/bin/bash
 # 一键构建 SmartPDF Pro macOS 应用包（.app），支持多架构。
-# 用法：./build_app.sh [release|dev] [all|x86_64|arm64|universal]
-#   all       构建 x86_64 + arm64 + universal 三个版本（默认）
+# 用法：./build_app.sh [release|dev] [all|x86_64|arm64]
+#   all       构建 x86_64 + arm64 两个版本（默认）
 #   x86_64    仅 Intel
 #   arm64     仅 Apple Silicon
-#   universal 仅通用二进制
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -15,9 +14,8 @@ ARCH="${2:-all}"
 case "$ARCH" in
   x86_64)    TARGETS="x86_64-apple-darwin" ;;
   arm64)     TARGETS="aarch64-apple-darwin" ;;
-  universal) TARGETS="x86_64-apple-darwin aarch64-apple-darwin" ;;
   all)       TARGETS="x86_64-apple-darwin aarch64-apple-darwin" ;;
-  *) echo "未知架构: ${ARCH}（应为 all|x86_64|arm64|universal）" >&2; exit 1 ;;
+  *) echo "未知架构: ${ARCH}（应为 all|x86_64|arm64）" >&2; exit 1 ;;
 esac
 
 # MODE → cargo 参数与产物子目录
@@ -33,22 +31,10 @@ for t in $TARGETS; do
   rustup target list --installed | grep -qx "$t" || rustup target add "$t"
 done
 
-declare -a BINS=()
 for t in $TARGETS; do
   echo "    -- cargo build $CARGO_FLAGS --target $t"
   cargo build $CARGO_FLAGS --target "$t"
-  BINS+=("target/$t/$SUBDIR/smartpdf-pro")
 done
-
-# universal：用 lipo 合并两个单架构二进制
-UNIVERSAL_BIN=""
-if [ "$ARCH" = "all" ] || [ "$ARCH" = "universal" ]; then
-  mkdir -p "target/universal/$SUBDIR"
-  UNIVERSAL_BIN="target/universal/$SUBDIR/smartpdf-pro"
-  echo "==> 合并 universal 二进制 (lipo)"
-  lipo -create "${BINS[@]}" -output "$UNIVERSAL_BIN"
-  file "$UNIVERSAL_BIN"
-fi
 
 # 与 src/icon.rs 内嵌的图标同源，保证 Dock 图标、窗口图标与 App 图标一致
 ICON=assets/icon-1024.png
@@ -94,20 +80,16 @@ case "$ARCH" in
   arm64)
     assemble_app "dist/SmartPDF Pro.app" "target/aarch64-apple-darwin/$SUBDIR/smartpdf-pro"
     ;;
-  universal)
-    assemble_app "dist/SmartPDF Pro.app" "$UNIVERSAL_BIN"
-    ;;
   all)
     assemble_app "dist/x86_64/SmartPDF Pro.app" "target/x86_64-apple-darwin/$SUBDIR/smartpdf-pro"
     assemble_app "dist/arm64/SmartPDF Pro.app" "target/aarch64-apple-darwin/$SUBDIR/smartpdf-pro"
-    assemble_app "dist/universal/SmartPDF Pro.app" "$UNIVERSAL_BIN"
     ;;
 esac
 
 echo "==> 4/5 完成"
 find dist -maxdepth 3 -name 'SmartPDF Pro.app' -print
 case "$ARCH" in
-  x86_64|arm64|universal) LAUNCH_APP="dist/SmartPDF Pro.app" ;;
-  all)                      LAUNCH_APP="dist/universal/SmartPDF Pro.app" ;;
+  x86_64|arm64) LAUNCH_APP="dist/SmartPDF Pro.app" ;;
+  all)          LAUNCH_APP="dist/arm64/SmartPDF Pro.app" ;;
 esac
 echo "启动方式：open \"$LAUNCH_APP\""

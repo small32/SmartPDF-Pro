@@ -34,7 +34,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # 一次构建产出 x86_64 / arm64 / Universal 三个 .app
+      # 一次构建产出 x86_64 / arm64 两个 .app
       - name: Build app bundles (all archs)
         run: ./build_app.sh release all
 
@@ -43,9 +43,6 @@ jobs:
         run: ditto -c -k --sequesterRsrc --keepParent "dist/x86_64/SmartPDF Pro.app" "SmartPDF-Pro-macOS-x86_64.zip"
       - name: Zip arm64
         run: ditto -c -k --sequesterRsrc --keepParent "dist/arm64/SmartPDF Pro.app" "SmartPDF-Pro-macOS-arm64.zip"
-      - name: Zip universal
-        run: ditto -c -k --sequesterRsrc --keepParent "dist/universal/SmartPDF Pro.app" "SmartPDF-Pro-macOS-universal.zip"
-
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -53,7 +50,6 @@ jobs:
           path: |
             SmartPDF-Pro-macOS-x86_64.zip
             SmartPDF-Pro-macOS-arm64.zip
-            SmartPDF-Pro-macOS-universal.zip
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -64,6 +60,5 @@ jobs:
           files: |
             SmartPDF-Pro-macOS-x86_64.zip
             SmartPDF-Pro-macOS-arm64.zip
-            SmartPDF-Pro-macOS-universal.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

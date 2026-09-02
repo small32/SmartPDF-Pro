@@ -23,6 +23,11 @@ pub struct RenderedPage {
     pub height: usize,
 }
 
+/// 将 MuPDF 的预乘 Alpha 颜色通道合成到白色背景。
+fn premultiplied_channel_on_white(channel: u8, alpha: u8) -> u8 {
+    (channel as u16 + (255 - alpha) as u16).min(255) as u8
+}
+
 /// 一个已打开的文档。
 pub struct Document {
     inner: MuDocument,
@@ -94,11 +99,10 @@ impl Document {
                 let g = row[p + 1];
                 let b = row[p + 2];
                 let a = row[p + 3] as u32;
-                // 白底合成：out_rgb = rgb*a + 255*(255-a)
-                let inv = 255 - a;
-                rgba.push(((r as u32 * a + 255 * inv) / 255) as u8);
-                rgba.push(((g as u32 * a + 255 * inv) / 255) as u8);
-                rgba.push(((b as u32 * a + 255 * inv) / 255) as u8);
+                // MuPDF 输出预乘 Alpha：白底合成时不能再次乘 alpha。
+                rgba.push(premultiplied_channel_on_white(r, a as u8));
+                rgba.push(premultiplied_channel_on_white(g, a as u8));
+                rgba.push(premultiplied_channel_on_white(b, a as u8));
                 rgba.push(255);
             }
         }
@@ -123,3 +127,16 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "pdf", "epub", "mobi", "azw", "azw3", "fb2", "cbz", "cbr", "cb7",
     "xps", "oxps", "svg", "djvu",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::premultiplied_channel_on_white;
+
+    #[test]
+    fn composites_premultiplied_channels_on_white_without_multiplying_twice() {
+        assert_eq!(premultiplied_channel_on_white(0, 0), 255);
+        assert_eq!(premultiplied_channel_on_white(64, 128), 191);
+        assert_eq!(premultiplied_channel_on_white(128, 128), 255);
+        assert_eq!(premultiplied_channel_on_white(200, 255), 200);
+    }
+}

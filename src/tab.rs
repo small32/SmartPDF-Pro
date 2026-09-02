@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use egui::{
     ColorImage, Context, TextureHandle, TextureId, TextureOptions,
@@ -25,7 +26,7 @@ struct RenderRequest {
 struct RenderResult {
     page: usize,
     zoom: f32,
-    rendered: RenderedPage,
+    rendered: Result<RenderedPage, String>,
 }
 
 /// 缓存 key：页码 + 缩放千分比。
@@ -64,13 +65,19 @@ fn render_worker(path: PathBuf, rx: Receiver<RenderRequest>, tx: Sender<RenderRe
         if doc.is_none() {
             match Document::open(&path) {
                 Ok(d) => doc = Some(d),
-                Err(_) => continue, // 文件打开失败：UI 侧会提示，这里静默
+                Err(error) => {
+                    let _ = tx.send(RenderResult {
+                        page,
+                        zoom,
+                        rendered: Err(error),
+                    });
+                    continue;
+                }
             }
         }
         if let Some(d) = doc.as_ref() {
-            if let Ok(rendered) = d.render_page(page, scale) {
-                let _ = tx.send(RenderResult { page, zoom, rendered });
-            }
+            let rendered = d.render_page(page, scale);
+            let _ = tx.send(RenderResult { page, zoom, rendered });
         }
     }
 }
@@ -96,11 +103,14 @@ pub struct DocTab {
     res_rx: Receiver<RenderResult>,
     /// 在途请求集合（同一 key 不重复发送；正文与缩略图缩放不同，多个 key 并存）。
     pending: std::collections::HashSet<RenderKey>,
+    /// 最近失败的请求；短暂冷却后允许重试，避免永久空白和每帧重试。
+    failed_at: HashMap<RenderKey, Instant>,
 }
 
 impl DocTab {
     /// 缓存页数上限：缩略图与正文共存（不同缩放），太小会频繁淘汰导致反复渲染。
     const CACHE_LIMIT: usize = 64;
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
 
     pub fn open(path: &Path) -> Result<Self, String> {
         let doc = Document::open(path)?;
@@ -127,6 +137,7 @@ impl DocTab {
             req_tx,
             res_rx,
             pending: std::collections::HashSet::new(),
+            failed_at: HashMap::new(),
         })
     }
 
@@ -154,9 +165,20 @@ impl DocTab {
         if self.caches.contains_key(&key) || self.pending.contains(&key) {
             return;
         }
+        if self
+            .failed_at
+            .get(&key)
+            .is_some_and(|failed| failed.elapsed() < Self::RETRY_DELAY)
+        {
+            return;
+        }
+        self.failed_at.remove(&key);
         self.pending.insert(key);
         let scale = self.render_scale(page, zoom, max_texture_side);
-        let _ = self.req_tx.send(RenderRequest { page, zoom, scale });
+        if self.req_tx.send(RenderRequest { page, zoom, scale }).is_err() {
+            self.pending.remove(&key);
+            self.failed_at.insert(key, Instant::now());
+        }
     }
 
     /// 计算安全的 MuPDF 渲染比例，保证输出纹理任一边不超过 GPU 上限。
@@ -176,6 +198,20 @@ impl DocTab {
         while let Ok(res) = self.res_rx.try_recv() {
             let key = Self::key(res.page, res.zoom);
             self.pending.remove(&key);
+            let rendered = match res.rendered {
+                Ok(rendered) => {
+                    self.failed_at.remove(&key);
+                    rendered
+                }
+                Err(error) => {
+                    self.failed_at.insert(key, Instant::now());
+                    log::warn!(
+                        "页面渲染失败，稍后重试: page={} zoom_permille={}: {}",
+                        res.page, key.1, error
+                    );
+                    continue;
+                }
+            };
             log::debug!("渲染完成: page={} zoom_permille={}", res.page, key.1);
             // 已缓存同 key，跳过（worker 可能重复返回同一请求）
             if self.caches.contains_key(&key) {
@@ -187,8 +223,8 @@ impl DocTab {
                 self.caches.remove(&oldest);
             }
             let image = ColorImage::from_rgba_unmultiplied(
-                [res.rendered.width, res.rendered.height],
-                &res.rendered.rgba,
+                [rendered.width, rendered.height],
+                &rendered.rgba,
             );
             let handle = ctx.load_texture("page", image, TextureOptions::LINEAR);
             self.order.retain(|k| *k != key);
@@ -249,11 +285,34 @@ mod tests {
 
         let res = res_rx.recv_timeout(Duration::from_secs(15)).unwrap();
         assert_eq!(res.page, 0);
-        assert!(res.rendered.width > 0 && res.rendered.height > 0);
+        let rendered = res.rendered.unwrap();
+        assert!(rendered.width > 0 && rendered.height > 0);
         assert_eq!(
-            res.rendered.rgba.len(),
-            res.rendered.width * res.rendered.height * 4
+            rendered.rgba.len(),
+            rendered.width * rendered.height * 4
         );
+    }
+
+    #[test]
+    fn worker_returns_errors_so_failed_requests_can_be_retried() {
+        let (req_tx, req_rx) = channel();
+        let (res_tx, res_rx) = channel();
+        thread::Builder::new()
+            .name("test-worker-error".into())
+            .spawn(move || render_worker(PathBuf::from("samples/demo.pdf"), req_rx, res_tx))
+            .unwrap();
+
+        req_tx
+            .send(RenderRequest {
+                page: usize::MAX,
+                zoom: 1.0,
+                scale: 1.5,
+            })
+            .unwrap();
+        drop(req_tx);
+
+        let res = res_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        assert!(res.rendered.is_err());
     }
 
     /// 页码跳转越界钳制正确。

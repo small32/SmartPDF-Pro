@@ -32,6 +32,39 @@ pub enum ViewMode {
 }
 
 const PAGE_GAP: f32 = 18.0;
+/// 中央文档页面的默认最大显示宽度，与 160px 缩略图保持 5 倍比例。
+const PAGE_MAX_WIDTH: f32 = 800.0;
+
+fn cumulative_page_offsets(heights: impl IntoIterator<Item = f32>) -> Vec<f32> {
+    let mut offsets = vec![0.0];
+    for height in heights {
+        offsets.push(offsets.last().copied().unwrap_or_default() + height.max(0.0));
+    }
+    offsets
+}
+
+fn page_at_offset(offsets: &[f32], y: f32) -> Option<usize> {
+    let page_count = offsets.len().checked_sub(1)?;
+    if page_count == 0 {
+        return None;
+    }
+    Some(
+        offsets
+            .partition_point(|offset| *offset <= y.max(0.0))
+            .saturating_sub(1)
+            .min(page_count - 1),
+    )
+}
+
+/// 计算需要布置和渲染的页面范围，并在视口上下各预取一页。
+fn visible_page_range(offsets: &[f32], viewport: egui::Rect) -> std::ops::Range<usize> {
+    let page_count = offsets.len().saturating_sub(1);
+    let Some(first_visible) = page_at_offset(offsets, viewport.top()) else {
+        return 0..0;
+    };
+    let last_visible = page_at_offset(offsets, viewport.bottom()).unwrap_or(first_visible);
+    first_visible.saturating_sub(1)..(last_visible + 2).min(page_count)
+}
 
 // ---- 标签条尺寸 ----
 /// 与 macOS 标题栏等高，标签才能与左上的红黄绿三色按钮齐平。
@@ -534,27 +567,23 @@ impl SmartPdfApp {
         // 缩略图宽度封顶：最大 160px（即使栏再宽也不继续放大，居中显示）。
         let cap = |w: f32| w.clamp(20.0, 160.0);
 
-        // 平均缩略图高度（作为 show_rows 行高，只渲染可见缩略图；用封顶后的宽度估算）
-        let est_w = cap(ui.available_width());
-        let mut sum_h = 0.0f32;
-        for p in 0..page_count {
-            let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
-            sum_h += est_w * h_pt / w_pt.max(0.01);
+        let live_w = cap(ui.available_width());
+        if (live_w - self.thumb_fit_width).abs() > 4.0 {
+            self.thumb_fit_width = live_w;
         }
-        let row_h = sum_h / page_count.max(1) as f32 + 6.0;
+        let zoom_base = self.thumb_fit_width.max(20.0);
+        let offsets = cumulative_page_offsets((0..page_count).map(|p| {
+            let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
+            live_w * h_pt / w_pt.max(0.01) + 6.0
+        }));
+        let total_height = offsets.last().copied().unwrap_or_default();
 
         ScrollArea::vertical()
             .id_salt("thumbs")
-            .show_rows(ui, row_h, page_count, |ui, range| {
-                // 实时可用宽度（封顶 320px）；栏再宽时保持 320 居中，不随栏继续放大。
-                // 渲染缩放用迟滞后的基准（>4px 才变），避免拖动时每帧重新渲染。
-                let live_w = cap(ui.available_width());
-                if (live_w - self.thumb_fit_width).abs() > 4.0 {
-                    self.thumb_fit_width = live_w;
-                }
-                let zoom_base = self.thumb_fit_width.max(20.0);
-
-                for p in range {
+            .show_viewport(ui, |ui, viewport| {
+                ui.set_height(total_height);
+                let content_top = ui.max_rect().top();
+                for p in visible_page_range(&offsets, viewport) {
                     let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
                     let h = live_w * h_pt / w_pt.max(0.01);
                     // 自适应缩放：渲染缩放使页面宽度铺满 zoom_base（egui 点），含 ppp 修正
@@ -562,12 +591,18 @@ impl SmartPdfApp {
                         (zoom_base * ppp / (w_pt * scale_px_per_pt(1.0))).clamp(0.05, 8.0);
                     // 只对可见缩略图发起渲染请求
                     self.tabs[i].request_render(p, zoom, max_texture_side);
-                    // 行占满整栏宽，缩略图（封顶 320px）在其中居中显示
+                    // 按真实累计高度布置，避免不同尺寸页面导致虚拟滚动偏移。
                     let row_w = ui.available_width().max(20.0);
+                    let row_rect = egui::Rect::from_min_size(
+                        egui::pos2(ui.max_rect().left(), content_top + offsets[p]),
+                        Vec2::new(row_w, h),
+                    );
                     let resp = ui
-                        .allocate_ui_with_layout(
-                            Vec2::new(row_w, h),
-                            Layout::centered_and_justified(egui::Direction::LeftToRight),
+                        .scope_builder(
+                            egui::UiBuilder::new()
+                                .id_salt(("thumb", p))
+                                .max_rect(row_rect)
+                                .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
                             |ui| {
                                 if let Some(tid) = self.tabs[i].display_texture_at(p, zoom) {
                                     ui.image(SizedTexture::new(tid, Vec2::new(live_w, h)));
@@ -581,7 +616,6 @@ impl SmartPdfApp {
                         self.tabs[i].goto(p);
                         self.scroll_target = Some(p);
                     }
-                    ui.add_space(6.0);
                 }
             });
     }
@@ -599,6 +633,7 @@ impl SmartPdfApp {
         let avail_w = ui.available_width();
 
         // 适应宽度：以「文档区域宽度」avail_w 为基准（CentralPanel 已排除左侧缩略图栏），
+        // 页面默认宽度封顶为 800px；窗口不足时自动缩小，高度按页面比例计算。
         // 只在宽度真实变化（>4px）时重算缩放。若每帧重算，垂直滚动条出现/消失会让宽度微变
         // → zoom 振荡、页面反复以不同缩放渲染（闪烁）。用 avail_w 做判据一次性更新，
         // 同时也能响应缩略图栏宽度变化。
@@ -610,7 +645,9 @@ impl SmartPdfApp {
             if tab.fit_width {
                 if (avail_w - tab.fit_width_viewport).abs() > 4.0 {
                     let (pw, _) = tab.page_size_pt();
-                    tab.zoom = (avail_w * ppp / (pw * scale_px_per_pt(1.0))).clamp(0.05, 8.0);
+                    let page_width = avail_w.min(PAGE_MAX_WIDTH);
+                    tab.zoom =
+                        (page_width * ppp / (pw * scale_px_per_pt(1.0))).clamp(0.05, 8.0);
                     tab.fit_width_viewport = avail_w;
                 }
             }
@@ -635,29 +672,40 @@ impl SmartPdfApp {
                 });
             }
             ViewMode::Continuous => {
-                // 平均页高（作为 show_rows 的行高，近似可见区）
-                let mut sum_h = 0.0f32;
-                for p in 0..page_count {
-                    sum_h += self.tabs[i].doc.page_size_pt(p).1;
-                }
-                let avg_h = sum_h / page_count.max(1) as f32 * px_per_pt / ppp;
-                let row_h = avg_h + gap;
+                let offsets = cumulative_page_offsets((0..page_count).map(|p| {
+                    self.tabs[i].doc.page_size_pt(p).1 * px_per_pt / ppp + gap
+                }));
+                let total_height = offsets.last().copied().unwrap_or_default();
 
                 let mut scroll = ScrollArea::vertical().id_salt("doc").auto_shrink([false, false]);
                 if let Some(p) = self.scroll_target.take() {
-                    scroll = scroll.vertical_scroll_offset(p as f32 * row_h);
+                    if let Some(offset) = offsets.get(p) {
+                        scroll = scroll.vertical_scroll_offset(*offset);
+                    }
                 }
 
-                scroll.show_rows(ui, row_h, page_count, |ui, range| {
-                    for p in range {
+                scroll.show_viewport(ui, |ui, viewport| {
+                    ui.set_height(total_height);
+                    let content_top = ui.max_rect().top();
+                    if let Some(current) = page_at_offset(&offsets, viewport.center().y) {
+                        self.tabs[i].page = current;
+                    }
+
+                    for p in visible_page_range(&offsets, viewport) {
                         let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
                         let w = w_pt * px_per_pt / ppp;
                         let h = h_pt * px_per_pt / ppp;
                         // 请求渲染（未缓存/未在途才发送）
                         self.tabs[i].request_render(p, zoom, max_texture_side);
-                        ui.allocate_ui_with_layout(
+                        let row_rect = egui::Rect::from_min_size(
+                            egui::pos2(ui.max_rect().left(), content_top + offsets[p]),
                             Vec2::new(avail_w, h),
-                            Layout::centered_and_justified(egui::Direction::LeftToRight),
+                        );
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .id_salt(("page", p))
+                                .max_rect(row_rect)
+                                .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
                             |ui| {
                                 if let Some(tid) = self.tabs[i].display_texture_for(p) {
                                     ui.image(SizedTexture::new(tid, Vec2::new(w, h)));
@@ -666,7 +714,6 @@ impl SmartPdfApp {
                                 }
                             },
                         );
-                        ui.add_space(gap);
                     }
                 });
             }
@@ -1291,7 +1338,31 @@ fn save_font_config(path: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{family_path, find_system_pingfang, font_is_renderable, list_system_fonts};
+    use super::{
+        cumulative_page_offsets, family_path, find_system_pingfang, font_is_renderable,
+        list_system_fonts, page_at_offset, visible_page_range,
+    };
+
+    #[test]
+    fn variable_page_offsets_preserve_real_heights() {
+        let offsets = cumulative_page_offsets([100.0, 250.0, 50.0]);
+        assert_eq!(offsets, [0.0, 100.0, 350.0, 400.0]);
+        assert_eq!(page_at_offset(&offsets, 0.0), Some(0));
+        assert_eq!(page_at_offset(&offsets, 99.0), Some(0));
+        assert_eq!(page_at_offset(&offsets, 100.0), Some(1));
+        assert_eq!(page_at_offset(&offsets, 399.0), Some(2));
+        assert_eq!(page_at_offset(&offsets, 999.0), Some(2));
+    }
+
+    #[test]
+    fn visible_range_uses_real_offsets_and_prefetches_neighbors() {
+        let offsets = cumulative_page_offsets([100.0, 250.0, 50.0, 400.0]);
+        let viewport = egui::Rect::from_min_max(egui::pos2(0.0, 120.0), egui::pos2(10.0, 360.0));
+        assert_eq!(visible_page_range(&offsets, viewport), 0..4);
+
+        let empty = cumulative_page_offsets([]);
+        assert_eq!(visible_page_range(&empty, viewport), 0..0);
+    }
 
     #[test]
     fn enumerates_system_fonts() {
