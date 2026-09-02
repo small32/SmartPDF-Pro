@@ -775,6 +775,11 @@ impl SmartPdfApp {
         for cmd in crate::sysmenu::take() {
             match cmd {
                 crate::sysmenu::SysCmd::Open => self.pick_and_open(),
+                crate::sysmenu::SysCmd::OpenFiles(paths) => {
+                    for p in paths {
+                        self.open_path(std::path::Path::new(&p));
+                    }
+                }
                 crate::sysmenu::SysCmd::Close => self.close_active(),
                 crate::sysmenu::SysCmd::Prev => self.navigate(-1),
                 crate::sysmenu::SysCmd::Next => self.navigate(1),

@@ -32,6 +32,41 @@
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.productivity</string>
 
+    <!-- 声明可打开文档类型：双击 / 「打开方式」时 LaunchServices 据此路由到本 App -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>PDF Document</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.adobe.pdf</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>EPUB Document</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>org.idpf.epub-container</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>CBZ Comic Archive</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.zip-archive</string>
+            </array>
+        </dict>
+    </array>
+
     <key>NSHighResolutionCapable</key>
     <true/>
 

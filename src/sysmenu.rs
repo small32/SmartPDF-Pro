@@ -26,9 +26,11 @@ use objc2_foundation::{NSData, NSNotificationCenter, NSPoint, NSRect, NSSize, NS
 use eframe::egui::Context;
 
 /// 系统菜单动作（经 channel 转给 egui App 处理）。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum SysCmd {
     Open,
+    /// 由 Finder「打开方式」/双击经 application:openFiles: 转来的文件路径。
+    OpenFiles(Vec<String>),
     Close,
     Prev,
     Next,
@@ -189,6 +191,97 @@ extern_conformance!(
     unsafe impl NSObjectProtocol for MenuTarget {}
 );
 
+// odoc 处理器：winit 强占 NSApplication delegate（断言必须是它自己的 ApplicationDelegate），
+// 因此不能 setDelegate 覆盖。改为向 NSAppleEventManager 注册「打开文档」事件处理器，
+// Finder 双击 / 「打开方式」的 odoc Apple Event 会落到这里，我们从中提取文件路径。
+// 提取全程用 msg_send! 原始调用，避免引入 objc2-core-services 类型。
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SmartPDFOdocHandler"]
+    pub struct OdocHandler;
+
+    impl OdocHandler {
+        #[unsafe(method(handleEvent:withReplyEvent:))]
+        fn handle_event(&self, event: &AnyObject, _reply: &AnyObject) {
+            log::info!("odoc handler 被调用");
+            let paths = extract_odoc_paths(event);
+            log::info!("odoc 提取到 {} 个路径", paths.len());
+            if !paths.is_empty() {
+                log::info!("收到系统打开请求：{} 个文件", paths.len());
+                send(SysCmd::OpenFiles(paths));
+            }
+        }
+    }
+);
+
+extern_conformance!(
+    unsafe impl NSObjectProtocol for OdocHandler {}
+);
+
+/// 从 odoc Apple Event 中提取文件路径。
+///
+/// 事件结构：directObject 参数是文件列表（NSAppleEventDescriptor 的 list），
+/// 每项是文件 URL 描述符；逐个取 fileURLValue → path 得到路径字符串。
+fn extract_odoc_paths(event: &AnyObject) -> Vec<String> {
+    const KEY_DIRECT_OBJECT: u32 = 0x2D2D2D2D; // '----'
+    let mut out = Vec::new();
+    unsafe {
+        // 取 directObject 参数（文件列表描述符）
+        let direct: *mut AnyObject =
+            msg_send![event, paramDescriptorForKeyword: KEY_DIRECT_OBJECT];
+        if direct.is_null() {
+            return out;
+        }
+        let count: usize = msg_send![direct, numberOfItems];
+        for i in 1..=count {
+            let item: *mut AnyObject = msg_send![direct, descriptorAtIndex: i];
+            if item.is_null() {
+                continue;
+            }
+            // 文件 URL 描述符 → NSURL → path
+            let url: *mut AnyObject = msg_send![item, fileURLValue];
+            if url.is_null() {
+                continue;
+            }
+            let path: *mut AnyObject = msg_send![url, path];
+            if path.is_null() {
+                continue;
+            }
+            let s: &NSString = &*(path as *const NSString);
+            let text = s.to_string();
+            if !text.is_empty() {
+                out.push(text);
+            }
+        }
+    }
+    out
+}
+
+/// 向 NSAppleEventManager 注册 odoc 事件处理器。
+fn install_odoc_handler(mtm: MainThreadMarker) {
+    const CORE_CLASS: u32 = 0x636F7265; // 'core' kCoreEventClass
+    const OPEN_DOCS: u32 = 0x6F646F63; // 'odoc' kAEOpenDocuments
+    unsafe {
+        // 保持处理器对象存活（NSAppleEventManager 对 handler 是弱引用）。
+        let handler = OdocHandler::new();
+        let _ = ODOC_HANDLER.with(|h| h.borrow_mut().replace(handler.clone()));
+        let sel = Sel::register(&CString::new("handleEvent:withReplyEvent:").unwrap());
+        let cls = objc2::runtime::AnyClass::get(&CString::new("NSAppleEventManager").unwrap())
+            .expect("NSAppleEventManager");
+        let aem: *mut AnyObject = msg_send![cls, sharedAppleEventManager];
+        let _: () = msg_send![
+            aem,
+            setEventHandler: &*handler,
+            andSelector: sel,
+            forEventClass: CORE_CLASS,
+            andEventID: OPEN_DOCS
+        ];
+        log::info!("odoc 处理器注册成功（{} 保持存活）", ODOC_HANDLER.with(|h| h.borrow().is_some()));
+        let _ = mtm;
+    }
+}
+
 // 实时缩放监听：macOS 拖拽缩放时窗口运行在 modal tracking run loop，自定义
 // NSWindow 样式（FullSizeContentView + MovableByWindowBackground）会干扰 winit 的
 // resize→repaint 链路，导致缩放期间不重绘、内容被 Core Animation 拉伸，松手才跳变。
@@ -233,6 +326,8 @@ extern_conformance!(
 thread_local! {
     /// 保持菜单目标对象存活（菜单 item 对 target 是弱引用）。
     static TARGET: RefCell<Option<Retained<MenuTarget>>> = RefCell::new(None);
+    /// 保持 odoc 处理器存活（NSAppleEventManager 对 handler 是弱引用）。
+    static ODOC_HANDLER: RefCell<Option<Retained<OdocHandler>>> = RefCell::new(None);
     /// 保持 Dock 图标存活（AppKit 对 applicationIconImage 是弱引用，不保活会回退黑白）。
     static DOCK_ICON: RefCell<Option<Retained<NSImage>>> = RefCell::new(None);
     /// 保持 resize 监听对象存活（NSNotificationCenter 不持有 observer）。
@@ -242,6 +337,16 @@ thread_local! {
 }
 
 impl MenuTarget {
+    fn new() -> Retained<Self> {
+        unsafe {
+            let mtm = MainThreadMarker::new_unchecked();
+            let this = mtm.alloc::<Self>().set_ivars(());
+            msg_send![super(this), init]
+        }
+    }
+}
+
+impl OdocHandler {
     fn new() -> Retained<Self> {
         unsafe {
             let mtm = MainThreadMarker::new_unchecked();
@@ -401,6 +506,10 @@ pub fn install() {
     let target = MenuTarget::new();
     let _ = TARGET.with(|t| t.borrow_mut().replace(target.clone()));
     let app = NSApplication::sharedApplication(mtm);
+    // 文件打开（Finder 双击 / 「打开方式」）：winit 占用 NSApplication delegate
+    // （断言必须是它自己的 ApplicationDelegate），不能 setDelegate。改为给
+    // NSAppleEventManager 注册 odoc（打开文档）处理器，从 Apple Event 中取文件路径。
+    install_odoc_handler(mtm);
     let menu_bar = NSMenu::new(mtm);
 
     // 应用菜单（关于 / 设置 / 退出）
