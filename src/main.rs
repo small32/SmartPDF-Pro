@@ -12,6 +12,11 @@ use std::sync::Arc;
 fn main() {
     env_logger::init();
 
+    // 必须在 eframe::run_native（[NSApp run]）之前注册 odoc（打开文档）处理器：
+    // LaunchServices 在 app 完成启动后立即投递「打开方式/双击」事件，
+    // 若等 egui 首帧再注册，事件先到会丢失，双击 PDF 报「无法打开该格式」。
+    sysmenu::install_odoc_early();
+
     // 命令行传入的文档
     let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
 

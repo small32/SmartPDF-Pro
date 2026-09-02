@@ -500,6 +500,17 @@ pub fn zoom_key_window() {
     );
 }
 
+/// 提前注册 odoc（打开文档）Apple Event 处理器。
+///
+/// 必须在 eframe::run_native（[NSApp run]）之前调用：LaunchServices 在 app
+/// 完成启动（finishLaunching）后立即投递 odoc 事件，若等 egui 首帧（App::new）
+/// 再注册，事件会先到而 handler 未就绪，事件丢失，系统报「无法打开该格式」。
+/// 幂等（对同一 eventClass/eventID 重复 setEventHandler 只是替换），主线程调用。
+pub fn install_odoc_early() {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    install_odoc_handler(mtm);
+}
+
 /// 安装系统菜单栏（在 egui 应用启动后调用一次，主线程）。
 pub fn install() {
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
@@ -508,8 +519,8 @@ pub fn install() {
     let app = NSApplication::sharedApplication(mtm);
     // 文件打开（Finder 双击 / 「打开方式」）：winit 占用 NSApplication delegate
     // （断言必须是它自己的 ApplicationDelegate），不能 setDelegate。改为给
-    // NSAppleEventManager 注册 odoc（打开文档）处理器，从 Apple Event 中取文件路径。
-    install_odoc_handler(mtm);
+    // NSAppleEventManager 注册 odoc（打开文档）处理器——已在 main() 里通过
+    // install_odoc_early() 提前注册（必须在 [NSApp run] 之前），这里不再重复。
     let menu_bar = NSMenu::new(mtm);
 
     // 应用菜单（关于 / 设置 / 退出）
