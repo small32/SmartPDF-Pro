@@ -3915,7 +3915,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smartpdf-pro"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ab_glyph",
  "block2 0.6.2",
@@ -3931,6 +3931,7 @@ dependencies = [
  "objc2-core-text",
  "objc2-foundation 0.3.2",
  "rfd",
+ "winit",
 ]
 
 [[package]]

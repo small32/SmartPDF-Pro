@@ -8,14 +8,13 @@ mod tab;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use winit::event_loop::EventLoop;
 
 fn main() {
     env_logger::init();
 
-    // 必须在 eframe::run_native（[NSApp run]）之前注册 odoc（打开文档）处理器：
-    // LaunchServices 在 app 完成启动后立即投递「打开方式/双击」事件，
-    // 若等 egui 首帧再注册，事件先到会丢失，双击 PDF 报「无法打开该格式」。
-    sysmenu::install_odoc_early();
+    // Finder 的打开请求可能在第一个 egui 帧之前到达，命令通道必须先就绪。
+    sysmenu::init_channel();
 
     // 命令行传入的文档
     let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -34,10 +33,19 @@ fn main() {
         ..Default::default()
     };
 
-    eframe::run_native(
+    // 自己创建 event loop，才能在 AppKit 开始分发启动事件之前，为 winit 已安装的
+    // NSApplicationDelegate 补上 application:openURLs:。不能替换整个 delegate，
+    // 否则会破坏 winit 的生命周期与窗口事件处理。
+    let event_loop = EventLoop::<eframe::UserEvent>::with_user_event()
+        .build()
+        .expect("创建事件循环失败");
+    sysmenu::install_file_open_handlers();
+
+    let mut native_app = eframe::create_native(
         "SmartPDF Pro",
         native_options,
         Box::new(move |cc| Ok(Box::new(app::SmartPdfApp::new(cc, files)))),
-    )
-    .expect("启动失败");
+        &event_loop,
+    );
+    event_loop.run_app(&mut native_app).expect("启动失败");
 }

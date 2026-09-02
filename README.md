@@ -70,12 +70,13 @@ cargo run --example render_check
 ./build_app.sh release x86_64      # 仅 Intel
 ./build_app.sh release arm64       # 仅 Apple Silicon
 ./build_app.sh release universal   # 仅通用二进制（lipo 合并）
-open "dist/SmartPDF Pro (Universal).app"   # 像普通 Mac 应用一样启动（Finder 双击亦可）
+open "dist/SmartPDF Pro.app"               # 单架构构建产物，Finder 双击亦可
 ```
 
 `build_app.sh [release|dev] [all|x86_64|arm64|universal]`：第二参数默认 `all`，一次构建三架构。
 Universal 版由 `lipo` 合并 x86_64 与 arm64 二进制，可在两种 Mac 上运行。
 CI（GitHub Actions）在打 `v*` tag 时也会同时构建三架构并作为三个 zip 发布到 Release。
+压缩包名称会标明架构，但解压后的应用统一命名为 `SmartPDF Pro.app`。
 
 打包内容：
 - `Contents/MacOS/SmartPDF Pro` — release 可执行文件（对应架构）

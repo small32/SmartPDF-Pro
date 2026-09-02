@@ -31,6 +31,21 @@ struct RenderResult {
 /// 缓存 key：页码 + 缩放千分比。
 type RenderKey = (usize, u32);
 
+fn clamp_render_scale(
+    width_pt: f32,
+    height_pt: f32,
+    requested: f32,
+    max_texture_side: usize,
+) -> f32 {
+    let longest_pt = width_pt.abs().max(height_pt.abs());
+    if longest_pt <= 0.0 || !longest_pt.is_finite() {
+        return requested;
+    }
+    // 给 MuPDF 的像素边界取整留少量余量，避免恰好超出一两个像素。
+    let safe_side = max_texture_side.saturating_sub(2).max(1) as f32;
+    requested.min(safe_side / longest_pt)
+}
+
 /// UI 线程持有的页面缓存（GPU 纹理）。
 struct CachedPage {
     handle: TextureHandle,
@@ -134,14 +149,24 @@ impl DocTab {
     // ---- 渲染请求 / 结果收集 ----
 
     /// 请求渲染指定页（未缓存且不在途时才发送）。
-    pub fn request_render(&mut self, page: usize, zoom: f32) {
+    pub fn request_render(&mut self, page: usize, zoom: f32, max_texture_side: usize) {
         let key = Self::key(page, zoom);
         if self.caches.contains_key(&key) || self.pending.contains(&key) {
             return;
         }
         self.pending.insert(key);
-        let scale = scale_px_per_pt(zoom);
+        let scale = self.render_scale(page, zoom, max_texture_side);
         let _ = self.req_tx.send(RenderRequest { page, zoom, scale });
+    }
+
+    /// 计算安全的 MuPDF 渲染比例，保证输出纹理任一边不超过 GPU 上限。
+    ///
+    /// 超长海报/画册 PDF 即使适应窗口宽度，高度仍可能超过 Metal 的纹理上限。
+    /// 此时只降低底层纹理分辨率，UI 仍按原 zoom 显示，因此页面尺寸与比例不变。
+    fn render_scale(&self, page: usize, zoom: f32, max_texture_side: usize) -> f32 {
+        let requested = scale_px_per_pt(zoom);
+        let (width_pt, height_pt) = self.doc.page_size_pt(page);
+        clamp_render_scale(width_pt, height_pt, requested, max_texture_side)
     }
 
     /// 收集渲染结果并上传纹理；返回是否有新缓存插入（调用方可据此决定是否重绘）。
@@ -239,5 +264,13 @@ mod tests {
         assert_eq!(tab.page, tab.doc.page_count - 1);
         tab.goto(0);
         assert_eq!(tab.page, 0);
+    }
+
+    #[test]
+    fn ultra_tall_page_is_clamped_to_gpu_texture_limit() {
+        let scale = clamp_render_scale(2839.5, 20767.5, 1.0, 8192);
+        assert!(20767.5 * scale <= 8190.0);
+        assert!(2839.5 * scale > 0.0);
+        assert_eq!(clamp_render_scale(612.0, 792.0, 1.0, 8192), 1.0);
     }
 }

@@ -270,8 +270,8 @@ pub struct SmartPdfApp {
 
 impl SmartPdfApp {
     pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
-        // 原生系统菜单栏（动作经 channel 转发给本 App）
-        crate::sysmenu::init_channel();
+        // 命令通道与 Finder openURLs handler 已在 main() 中、进入 AppKit
+        // 事件循环前初始化，避免冷启动的打开文档事件先到而被丢弃。
         let saved_font = load_font_config();
         setup_cjk_fonts(&cc.egui_ctx, saved_font.as_deref());
         // 注册 egui 上下文，供原生 resize 回调在实时缩放时强制重绘
@@ -529,6 +529,7 @@ impl SmartPdfApp {
         };
         let page_count = self.tabs[i].doc.page_count;
         let ppp = ui.ctx().pixels_per_point();
+        let max_texture_side = ui.ctx().input(|input| input.max_texture_side);
 
         // 缩略图宽度封顶：最大 160px（即使栏再宽也不继续放大，居中显示）。
         let cap = |w: f32| w.clamp(20.0, 160.0);
@@ -560,7 +561,7 @@ impl SmartPdfApp {
                     let zoom =
                         (zoom_base * ppp / (w_pt * scale_px_per_pt(1.0))).clamp(0.05, 8.0);
                     // 只对可见缩略图发起渲染请求
-                    self.tabs[i].request_render(p, zoom);
+                    self.tabs[i].request_render(p, zoom, max_texture_side);
                     // 行占满整栏宽，缩略图（封顶 320px）在其中居中显示
                     let row_w = ui.available_width().max(20.0);
                     let resp = ui
@@ -594,6 +595,7 @@ impl SmartPdfApp {
         };
         let ctx = ui.ctx().clone();
         let ppp = ctx.pixels_per_point();
+        let max_texture_side = ctx.input(|input| input.max_texture_side);
         let avail_w = ui.available_width();
 
         // 适应宽度：以「文档区域宽度」avail_w 为基准（CentralPanel 已排除左侧缩略图栏），
@@ -622,7 +624,7 @@ impl SmartPdfApp {
         match self.view_mode {
             ViewMode::Single => {
                 let page = self.tabs[i].page;
-                self.tabs[i].request_render(page, zoom);
+                self.tabs[i].request_render(page, zoom, max_texture_side);
                 ui.centered_and_justified(|ui| {
                     if let Some(tid) = self.tabs[i].display_texture_for(page) {
                         let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(page);
@@ -652,7 +654,7 @@ impl SmartPdfApp {
                         let w = w_pt * px_per_pt / ppp;
                         let h = h_pt * px_per_pt / ppp;
                         // 请求渲染（未缓存/未在途才发送）
-                        self.tabs[i].request_render(p, zoom);
+                        self.tabs[i].request_render(p, zoom, max_texture_side);
                         ui.allocate_ui_with_layout(
                             Vec2::new(avail_w, h),
                             Layout::centered_and_justified(egui::Direction::LeftToRight),
@@ -847,12 +849,13 @@ impl SmartPdfApp {
 
         // 高清渲染缩放：渲染像素 ≈ 显示像素
         let ppp = ui.ctx().pixels_per_point();
+        let max_texture_side = ui.ctx().input(|input| input.max_texture_side);
         let pres_zoom = ((disp_w * ppp) / pw / scale_px_per_pt(1.0)).clamp(0.1, 4.0);
         // 预渲染当前页与相邻页（翻页时高清图已就绪，避免先模糊）
         let lo = page.saturating_sub(1);
         let hi = (page + 1).min(page_count.saturating_sub(1));
         for np in lo..=hi {
-            self.tabs[i].request_render(np, pres_zoom);
+            self.tabs[i].request_render(np, pres_zoom, max_texture_side);
         }
 
         // 黑底

@@ -1,6 +1,6 @@
 [package]
 name = "smartpdf-pro"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "SmartPDF Pro - 面向 macOS 的轻量多格式阅读器（PDF/EPUB/CBZ 等）"
 
@@ -10,6 +10,7 @@ mupdf = "0.8"
 # 纯 Rust 即时模式 GUI
 eframe = "0.36"
 egui = "0.36"
+winit = "0.30"
 # 原生系统菜单栏（macOS 顶部菜单），动作经 channel 转发给 egui
 objc2 = "0.6.4"
 # block2 特性提供 NSAnimationContext::runAnimationGroup（异步窗口缩放动画）

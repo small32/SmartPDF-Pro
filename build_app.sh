@@ -55,19 +55,24 @@ ICON=assets/icon-1024.png
 
 echo "==> 2/4 生成应用图标"
 [ -f "$ICON" ] || cargo run --quiet --example gen_icon -- "$ICON"
-rm -rf target/AppIcon.iconset
-mkdir -p target/AppIcon.iconset
+# macOS 26 的 iconutil 会把工作区内带 com.apple.provenance 扩展属性的
+# .iconset 误判为 Invalid Iconset。在系统临时目录生成可避开该属性，
+# 完成后只把最终 .icns 写回 target。
+ICON_WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$ICON_WORK_DIR"' EXIT
+ICONSET="$ICON_WORK_DIR/AppIcon.iconset"
+mkdir -p "$ICONSET"
 for sz in 16 32 128 256 512; do
-    sips -z "$sz" "$sz" "$ICON" --out "target/AppIcon.iconset/icon_${sz}x${sz}.png" >/dev/null
+    sips -z "$sz" "$sz" "$ICON" --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null
     d=$((sz * 2))
-    sips -z "$d" "$d" "$ICON" --out "target/AppIcon.iconset/icon_${sz}x${sz}@2x.png" >/dev/null
+    sips -z "$d" "$d" "$ICON" --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null
 done
-iconutil -c icns target/AppIcon.iconset -o target/AppIcon.icns
+iconutil -c icns "$ICONSET" -o target/AppIcon.icns
 
-# 组装单个 .app：$1=app 名称，$2=二进制路径
+# 组装单个 .app：$1=输出路径，$2=二进制路径。
+# 应用包本身始终命名为 SmartPDF Pro.app；all 模式仅通过父目录区分架构。
 assemble_app() {
-  local app_name="$1" bin="$2"
-  local app="dist/$app_name"
+  local app="$1" bin="$2"
   echo "==> 组装 $app"
   rm -rf "$app"
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
@@ -84,21 +89,25 @@ assemble_app() {
 echo "==> 3/5 组装应用包"
 case "$ARCH" in
   x86_64)
-    assemble_app "SmartPDF Pro (x86_64).app" "target/x86_64-apple-darwin/$SUBDIR/smartpdf-pro"
+    assemble_app "dist/SmartPDF Pro.app" "target/x86_64-apple-darwin/$SUBDIR/smartpdf-pro"
     ;;
   arm64)
-    assemble_app "SmartPDF Pro (arm64).app" "target/aarch64-apple-darwin/$SUBDIR/smartpdf-pro"
+    assemble_app "dist/SmartPDF Pro.app" "target/aarch64-apple-darwin/$SUBDIR/smartpdf-pro"
     ;;
   universal)
-    assemble_app "SmartPDF Pro (Universal).app" "$UNIVERSAL_BIN"
+    assemble_app "dist/SmartPDF Pro.app" "$UNIVERSAL_BIN"
     ;;
   all)
-    assemble_app "SmartPDF Pro (x86_64).app" "target/x86_64-apple-darwin/$SUBDIR/smartpdf-pro"
-    assemble_app "SmartPDF Pro (arm64).app" "target/aarch64-apple-darwin/$SUBDIR/smartpdf-pro"
-    assemble_app "SmartPDF Pro (Universal).app" "$UNIVERSAL_BIN"
+    assemble_app "dist/x86_64/SmartPDF Pro.app" "target/x86_64-apple-darwin/$SUBDIR/smartpdf-pro"
+    assemble_app "dist/arm64/SmartPDF Pro.app" "target/aarch64-apple-darwin/$SUBDIR/smartpdf-pro"
+    assemble_app "dist/universal/SmartPDF Pro.app" "$UNIVERSAL_BIN"
     ;;
 esac
 
 echo "==> 4/5 完成"
-ls -1 dist/*.app
-echo "启动方式：open \"dist/SmartPDF Pro (Universal).app\""
+find dist -maxdepth 3 -name 'SmartPDF Pro.app' -print
+case "$ARCH" in
+  x86_64|arm64|universal) LAUNCH_APP="dist/SmartPDF Pro.app" ;;
+  all)                      LAUNCH_APP="dist/universal/SmartPDF Pro.app" ;;
+esac
+echo "启动方式：open \"$LAUNCH_APP\""

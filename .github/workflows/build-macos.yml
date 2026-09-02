@@ -40,11 +40,11 @@ jobs:
 
       # 分别打包三个 zip，保留 .app 包结构
       - name: Zip x86_64
-        run: ditto -c -k --sequesterRsrc --keepParent "dist/SmartPDF Pro (x86_64).app" "SmartPDF-Pro-macOS-x86_64.zip"
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/x86_64/SmartPDF Pro.app" "SmartPDF-Pro-macOS-x86_64.zip"
       - name: Zip arm64
-        run: ditto -c -k --sequesterRsrc --keepParent "dist/SmartPDF Pro (arm64).app" "SmartPDF-Pro-macOS-arm64.zip"
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/arm64/SmartPDF Pro.app" "SmartPDF-Pro-macOS-arm64.zip"
       - name: Zip universal
-        run: ditto -c -k --sequesterRsrc --keepParent "dist/SmartPDF Pro (Universal).app" "SmartPDF-Pro-macOS-universal.zip"
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/universal/SmartPDF Pro.app" "SmartPDF-Pro-macOS-universal.zip"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -60,6 +60,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
           files: |
             SmartPDF-Pro-macOS-x86_64.zip
             SmartPDF-Pro-macOS-arm64.zip
