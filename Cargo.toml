@@ -1,12 +1,15 @@
 [package]
 name = "smartpdf-pro"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 description = "SmartPDF Pro - 面向 macOS 的轻量多格式阅读器（PDF/EPUB/CBZ 等）"
 
 [dependencies]
 # MuPDF 安全 Rust 绑定，默认 features 自带 PDF/EPUB/MOBI/CBZ/FB2/XPS/SVG 支持
 mupdf = "0.8"
+# OFD（开放版式文档 GB/T 33190—2016）：MuPDF 不支持该格式，
+# 由纯 Rust 的 ofd-core 负责解析与渲染页面像素。
+ofd-core = { path = "../ofd-utility/ofd-core" }
 # 纯 Rust 即时模式 GUI
 eframe = "0.36"
 egui = "0.36"

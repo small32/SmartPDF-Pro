@@ -18,10 +18,10 @@
     <string>APPL</string>
 
     <key>CFBundleShortVersionString</key>
-    <string>0.2.3</string>
+    <string>0.3.0</string>
 
     <key>CFBundleVersion</key>
-    <string>0.2.3</string>
+    <string>0.3.0</string>
 
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
@@ -69,6 +69,21 @@
             <key>LSItemContentTypes</key>
             <array>
                 <string>public.zip-archive</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>OFD Document</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <!-- Owner：让本 App 成为 .ofd 的默认处理器，双击即可自动打开。
+                 macOS 系统已内置 public.ofd 这个 UTI，.ofd 文件被识别为该类型，
+                 所以这里必须声明 System 域的 public.ofd，而非自定义 UTI。 -->
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.ofd</string>
             </array>
         </dict>
     </array>

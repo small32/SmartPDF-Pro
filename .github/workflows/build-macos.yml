@@ -20,6 +20,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ofd-core 以路径依赖（../ofd-utility/ofd-core）引入，CI 需要把
+      # ofd-utility 克隆到 SmartPDF-Pro 的兄弟目录，cargo 的路径依赖才能解析。
+      # 固定到本地验证所用的一致提交，保证渲染 API 一致。
+      - name: Checkout ofd-utility (path dependency)
+        run: git clone --depth 1 https://github.com/ofd-utility/ofd-utility.git "${{ runner.workspace }}/ofd-utility"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
