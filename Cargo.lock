@@ -3055,6 +3055,7 @@ dependencies = [
 [[package]]
 name = "ofd-core"
 version = "0.3.0"
+source = "git+https://github.com/ofd-utility/ofd-utility.git?rev=d603791e933a81936b23c91dcab90fdc4c2c0edf#d603791e933a81936b23c91dcab90fdc4c2c0edf"
 dependencies = [
  "fontdb",
  "image",
@@ -4004,7 +4005,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smartpdf-pro"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "ab_glyph",
  "block2 0.6.2",

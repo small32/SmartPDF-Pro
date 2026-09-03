@@ -9,7 +9,7 @@ description = "SmartPDF Pro - 面向 macOS 的轻量多格式阅读器（PDF/EPU
 mupdf = "0.8"
 # OFD（开放版式文档 GB/T 33190—2016）：MuPDF 不支持该格式，
 # 由纯 Rust 的 ofd-core 负责解析与渲染页面像素。
-ofd-core = { path = "../ofd-utility/ofd-core" }
+ofd-core = { git = "https://github.com/ofd-utility/ofd-utility.git", package = "ofd-core", rev = "d603791e933a81936b23c91dcab90fdc4c2c0edf" }
 # 纯 Rust 即时模式 GUI
 eframe = "0.36"
 egui = "0.36"
