@@ -603,20 +603,17 @@ impl SmartPdfApp {
         };
         let want = self.doc_scroll_y * k;
 
+        // 仅当「主区位置确实变了」时一次性强制缩略图跟随主区，不每帧覆盖，保留缩略图栏自由滚动。
+        // forced 标记用于区分「本帧是我们在同步主区」还是「用户在拖缩略图栏」：被强制/被 egui 夹取
+        // 的那一帧若按位置偏差反向回灌，会把主图拽回、导致弹回原页、滚不到底。故强制帧禁止反向写。
+        let forced_this_frame = k > 0.0 && (want - self.thumb_last_want).abs() > 1.0;
         let mut scroll = ScrollArea::vertical().id_salt("thumbs");
-        // 仅在「主区位置确实变了」时一次性强制缩略图跟随，不每帧覆盖，保留缩略图栏自由滚动。
-        if (want - self.thumb_last_want).abs() > 1.0 {
+        if forced_this_frame {
             scroll = scroll.vertical_scroll_offset(want);
-            self.thumb_last_want = want;
         }
+        let mut actual_scroll = 0.0f32;
         scroll.show_viewport(ui, |ui, viewport| {
-            let actual = viewport.min.y;
-            // 用户拖动缩略图栏（实际位置偏离期望）时回灌共享位置，主图随之跟随。
-            if (actual - want).abs() > 2.0 && self.doc_total_height > 0.0 {
-                self.doc_scroll_y = actual / k;
-                self.doc_scroll_force = Some(actual / k);
-                self.thumb_last_want = want;
-            }
+            actual_scroll = viewport.min.y;
             ui.set_height(total_height);
             let content_top = ui.max_rect().top();
                 for p in visible_page_range(&offsets, viewport) {
@@ -654,6 +651,23 @@ impl SmartPdfApp {
                     }
                 }
             });
+
+        // 反向同步：仅当本帧「没有」主区→缩略图强制、且缩略图真实位置相对上次稳定位置有变化，
+        // 才视为用户拖动缩略图栏并回灌主图；刚被强制或 egui 夹取的那一帧一律以真实位置为基准、不写回，
+        // 由此杜绝「主图被拽回、弹回原页、滚不到底」的回归。
+        let actual = actual_scroll;
+        if forced_this_frame {
+            self.thumb_last_want = actual;
+        } else if (actual - self.thumb_last_want).abs() > 1.0
+            && self.doc_total_height > 0.0
+            && k > 0.0
+        {
+            self.doc_scroll_y = actual / k;
+            self.doc_scroll_force = Some(actual / k);
+            self.thumb_last_want = actual;
+        } else {
+            self.thumb_last_want = actual;
+        }
     }
 
     // ---- 中央文档面板 ----
