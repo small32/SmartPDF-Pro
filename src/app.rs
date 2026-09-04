@@ -296,10 +296,6 @@ pub struct SmartPdfApp {
     doc_scroll_y: f32,
     /// 连续模式主文档内容总高度（像素），供缩略图栏换算跟随比例 k = 缩略图总高 / 此值。
     doc_total_height: f32,
-    /// 缩略图栏上次被强制跟随到的位置（content 坐标），用于检测主区是否移动从而触发一次性跟随。
-    thumb_last_want: f32,
-    /// 一次性强制主文档区滚动到指定偏移（由拖拽缩略图栏触发）；消费后清空，避免每帧覆盖用户拖动。
-    doc_scroll_force: Option<f32>,
     /// 「设置」窗口是否打开。
     show_settings: bool,
     /// 用户选择的界面字体文件路径（None = 系统默认）。
@@ -335,8 +331,6 @@ impl SmartPdfApp {
             thumb_fit_width: 0.0,
             doc_scroll_y: 0.0,
             doc_total_height: 0.0,
-            thumb_last_want: 0.0,
-            doc_scroll_force: None,
             show_settings: false,
             ui_font: saved_font,
             settings_pending: None,
@@ -367,8 +361,6 @@ impl SmartPdfApp {
                 // 新文档从顶部开始：清空主区滚动位置，缩略图栏随之归零。
                 self.doc_scroll_y = 0.0;
                 self.doc_total_height = 0.0;
-                self.thumb_last_want = 0.0;
-                self.doc_scroll_force = None;
                 self.status = format!("已打开「{}」", title);
             }
             Err(e) => self.status = format!("无法打开 {}：{}", path.display(), e),
@@ -601,73 +593,50 @@ impl SmartPdfApp {
         } else {
             0.0
         };
+        // 纯跟随：缩略图栏是主文档滚动位置的镜像。doc_scroll_y 每帧由 doc_panel 回灌为主区真实偏移，
+        // 这里按 k = 缩略图总高 / 主文档总高 比例同步缩略图栏滚动位置。缩略图栏不回写 doc_scroll_y，
+        // 因此不存在反馈环路，主文档区始终可自由滚动到任意页。点击缩略图跳页走 scroll_target（主区一次性跳页）。
         let want = self.doc_scroll_y * k;
 
-        // 仅当「主区位置确实变了」时一次性强制缩略图跟随主区，不每帧覆盖，保留缩略图栏自由滚动。
-        // forced 标记用于区分「本帧是我们在同步主区」还是「用户在拖缩略图栏」：被强制/被 egui 夹取
-        // 的那一帧若按位置偏差反向回灌，会把主图拽回、导致弹回原页、滚不到底。故强制帧禁止反向写。
-        let forced_this_frame = k > 0.0 && (want - self.thumb_last_want).abs() > 1.0;
-        let mut scroll = ScrollArea::vertical().id_salt("thumbs");
-        if forced_this_frame {
-            scroll = scroll.vertical_scroll_offset(want);
-        }
-        let mut actual_scroll = 0.0f32;
+        let scroll = ScrollArea::vertical().id_salt("thumbs").vertical_scroll_offset(want);
         scroll.show_viewport(ui, |ui, viewport| {
-            actual_scroll = viewport.min.y;
             ui.set_height(total_height);
             let content_top = ui.max_rect().top();
-                for p in visible_page_range(&offsets, viewport) {
-                    let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
-                    let h = live_w * h_pt / w_pt.max(0.01);
-                    // 自适应缩放：渲染缩放使页面宽度铺满 zoom_base（egui 点），含 ppp 修正
-                    let zoom =
-                        (zoom_base * ppp / (w_pt * scale_px_per_pt(1.0))).clamp(0.05, 8.0);
-                    // 只对可见缩略图发起渲染请求
-                    self.tabs[i].request_render(p, zoom, max_texture_side);
-                    // 按真实累计高度布置，避免不同尺寸页面导致虚拟滚动偏移。
-                    let row_w = ui.available_width().max(20.0);
-                    let row_rect = egui::Rect::from_min_size(
-                        egui::pos2(ui.max_rect().left(), content_top + offsets[p]),
-                        Vec2::new(row_w, h),
-                    );
-                    let resp = ui
-                        .scope_builder(
-                            egui::UiBuilder::new()
-                                .id_salt(("thumb", p))
-                                .max_rect(row_rect)
-                                .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
-                            |ui| {
-                                if let Some(tid) = self.tabs[i].display_texture_at(p, zoom) {
-                                    ui.image(SizedTexture::new(tid, Vec2::new(live_w, h)));
-                                } else {
-                                    ui.allocate_space(Vec2::new(live_w, h));
-                                }
-                            },
-                        )
-                        .response;
-                    if resp.clicked() {
-                        self.tabs[i].goto(p);
-                        self.scroll_target = Some(p);
-                    }
+            for p in visible_page_range(&offsets, viewport) {
+                let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
+                let h = live_w * h_pt / w_pt.max(0.01);
+                // 自适应缩放：渲染缩放使页面宽度铺满 zoom_base（egui 点），含 ppp 修正
+                let zoom =
+                    (zoom_base * ppp / (w_pt * scale_px_per_pt(1.0))).clamp(0.05, 8.0);
+                // 只对可见缩略图发起渲染请求
+                self.tabs[i].request_render(p, zoom, max_texture_side);
+                // 按真实累计高度布置，避免不同尺寸页面导致虚拟滚动偏移。
+                let row_w = ui.available_width().max(20.0);
+                let row_rect = egui::Rect::from_min_size(
+                    egui::pos2(ui.max_rect().left(), content_top + offsets[p]),
+                    Vec2::new(row_w, h),
+                );
+                let resp = ui
+                    .scope_builder(
+                        egui::UiBuilder::new()
+                            .id_salt(("thumb", p))
+                            .max_rect(row_rect)
+                            .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
+                        |ui| {
+                            if let Some(tid) = self.tabs[i].display_texture_at(p, zoom) {
+                                ui.image(SizedTexture::new(tid, Vec2::new(live_w, h)));
+                            } else {
+                                ui.allocate_space(Vec2::new(live_w, h));
+                            }
+                        },
+                    )
+                    .response;
+                if resp.clicked() {
+                    self.tabs[i].goto(p);
+                    self.scroll_target = Some(p);
                 }
-            });
-
-        // 反向同步：仅当本帧「没有」主区→缩略图强制、且缩略图真实位置相对上次稳定位置有变化，
-        // 才视为用户拖动缩略图栏并回灌主图；刚被强制或 egui 夹取的那一帧一律以真实位置为基准、不写回，
-        // 由此杜绝「主图被拽回、弹回原页、滚不到底」的回归。
-        let actual = actual_scroll;
-        if forced_this_frame {
-            self.thumb_last_want = actual;
-        } else if (actual - self.thumb_last_want).abs() > 1.0
-            && self.doc_total_height > 0.0
-            && k > 0.0
-        {
-            self.doc_scroll_y = actual / k;
-            self.doc_scroll_force = Some(actual / k);
-            self.thumb_last_want = actual;
-        } else {
-            self.thumb_last_want = actual;
-        }
+            }
+        });
     }
 
     // ---- 中央文档面板 ----
@@ -729,17 +698,12 @@ impl SmartPdfApp {
                 self.doc_total_height = total_height;
 
                 let mut scroll = ScrollArea::vertical().id_salt("doc").auto_shrink([false, false]);
-                // 跳页（缩略图点击/翻页）：一次性强制主区到目标页，并同步共享位置。
+                // 跳页（缩略图点击/翻页/标签切换）：仅在此一次性强制主区到目标页，其余帧主区完全自由滚动。
                 if let Some(p) = self.scroll_target.take() {
                     if let Some(offset) = offsets.get(p) {
                         self.doc_scroll_y = *offset;
                         scroll = scroll.vertical_scroll_offset(self.doc_scroll_y);
                     }
-                }
-                // 反向同步：拖拽缩略图栏时一次性强制主区跟随，消费后清空（不每帧覆盖，保留用户自由滚动）。
-                if let Some(f) = self.doc_scroll_force.take() {
-                    self.doc_scroll_y = f;
-                    scroll = scroll.vertical_scroll_offset(f);
                 }
 
                 scroll.show_viewport(ui, |ui, viewport| {
