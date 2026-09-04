@@ -292,6 +292,10 @@ pub struct SmartPdfApp {
     last_viewport: egui::Vec2,
     /// 缩略图栏上次计算适应宽度时的面板宽度（用于避免每帧振荡重算）。
     thumb_fit_width: f32,
+    /// 连续模式主文档区的实时滚动偏移（文档内容坐标系，像素），用于与缩略图栏双向同步。
+    doc_scroll_y: f32,
+    /// 连续模式主文档内容总高度（像素），供缩略图栏换算跟随比例 k = 缩略图总高 / 此值。
+    doc_total_height: f32,
     /// 「设置」窗口是否打开。
     show_settings: bool,
     /// 用户选择的界面字体文件路径（None = 系统默认）。
@@ -325,6 +329,8 @@ impl SmartPdfApp {
             titlebar_dbl_pos: egui::Pos2::ZERO,
             last_viewport: egui::Vec2::ZERO,
             thumb_fit_width: 0.0,
+            doc_scroll_y: 0.0,
+            doc_total_height: 0.0,
             show_settings: false,
             ui_font: saved_font,
             settings_pending: None,
@@ -352,6 +358,9 @@ impl SmartPdfApp {
                 let title = tab.title.clone();
                 self.tabs.push(tab);
                 self.active = Some(self.tabs.len() - 1);
+                // 新文档从顶部开始：清空主区滚动位置，缩略图栏随之归零。
+                self.doc_scroll_y = 0.0;
+                self.doc_total_height = 0.0;
                 self.status = format!("已打开「{}」", title);
             }
             Err(e) => self.status = format!("无法打开 {}：{}", path.display(), e),
@@ -577,12 +586,25 @@ impl SmartPdfApp {
             live_w * h_pt / w_pt.max(0.01) + 6.0
         }));
         let total_height = offsets.last().copied().unwrap_or_default();
+        // 跟随比例 k：缩略图总高 / 主文档总高。两栏内容均为「各页累计高度」，比例近似恒定，
+        // 故主区滚动 offset 乘以 k 即缩略图栏应处的位置。
+        let k = if self.doc_total_height > 0.0 {
+            total_height / self.doc_total_height
+        } else {
+            0.0
+        };
+        let want = self.doc_scroll_y * k;
 
-        ScrollArea::vertical()
-            .id_salt("thumbs")
-            .show_viewport(ui, |ui, viewport| {
-                ui.set_height(total_height);
-                let content_top = ui.max_rect().top();
+        let mut scroll = ScrollArea::vertical().id_salt("thumbs");
+        scroll = scroll.vertical_scroll_offset(want);
+        scroll.show_viewport(ui, |ui, viewport| {
+            let actual = viewport.min.y;
+            // 用户拖动缩略图栏（实际位置偏离期望）时回灌共享位置，主图随之跟随。
+            if (actual - want).abs() > 2.0 && self.doc_total_height > 0.0 {
+                self.doc_scroll_y = actual / k;
+            }
+            ui.set_height(total_height);
+            let content_top = ui.max_rect().top();
                 for p in visible_page_range(&offsets, viewport) {
                     let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
                     let h = live_w * h_pt / w_pt.max(0.01);
@@ -676,17 +698,22 @@ impl SmartPdfApp {
                     self.tabs[i].doc.page_size_pt(p).1 * px_per_pt / ppp + gap
                 }));
                 let total_height = offsets.last().copied().unwrap_or_default();
+                self.doc_total_height = total_height;
 
                 let mut scroll = ScrollArea::vertical().id_salt("doc").auto_shrink([false, false]);
+                // 跳页（缩略图点击/翻页）优先：置位时同步共享滚动位置并清理一次性目标。
                 if let Some(p) = self.scroll_target.take() {
                     if let Some(offset) = offsets.get(p) {
-                        scroll = scroll.vertical_scroll_offset(*offset);
+                        self.doc_scroll_y = *offset;
                     }
                 }
+                scroll = scroll.vertical_scroll_offset(self.doc_scroll_y);
 
                 scroll.show_viewport(ui, |ui, viewport| {
                     ui.set_height(total_height);
                     let content_top = ui.max_rect().top();
+                    // 回灌：用户拖动主滚动条时，把主区实际偏移写回共享位置，驱动缩略图栏跟随。
+                    self.doc_scroll_y = viewport.min.y;
                     if let Some(current) = page_at_offset(&offsets, viewport.center().y) {
                         self.tabs[i].page = current;
                     }
