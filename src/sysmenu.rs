@@ -521,6 +521,18 @@ pub fn install() {
     ));
     app_menu.addItem(&menu_item(mtm, Some(&target), "字体设置…", "openSettings:", ","));
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // 标准隐藏/退出动作：hide:/hideOtherApplications:/unhideAllApplications: 走响应链，由 AppKit 处理。
+    app_menu.addItem(&menu_item(mtm, None, "隐藏 SmartPDF Pro", "hide:", "h"));
+    app_menu.addItem(&menu_item_mods(
+        mtm,
+        None,
+        "隐藏其他",
+        "hideOtherApplications:",
+        "h",
+        NSEventModifierFlags::Command | NSEventModifierFlags::Option,
+    ));
+    app_menu.addItem(&menu_item(mtm, None, "全部显示", "unhideAllApplications:", ""));
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     app_menu.addItem(&menu_item(mtm, None, "退出 SmartPDF Pro", "terminate:", "q"));
     menu_bar.addItem(&top_menu(mtm, "SmartPDF Pro", &app_menu));
 
@@ -586,6 +598,27 @@ pub fn install() {
         ));
     }
     menu_bar.addItem(&top_menu(mtm, "缩放", &zoom_menu));
+
+    // 窗口（标准 macOS 窗口管理动作：最小化 ⌘M 等，走响应链落到 key window，由 AppKit 处理）
+    let window_menu = NSMenu::new(mtm);
+    window_menu.addItem(&menu_item(
+        mtm,
+        None,
+        "最小化",
+        "performMiniaturize:",
+        "m",
+    ));
+    window_menu.addItem(&menu_item_mods(
+        mtm,
+        None,
+        "最小化并缩放",
+        "performMiniaturize:",
+        "m",
+        NSEventModifierFlags::Command | NSEventModifierFlags::Option,
+    ));
+    window_menu.addItem(&menu_item(mtm, None, "缩放", "performZoom:", ""));
+    window_menu.addItem(&menu_item(mtm, None, "全部置于前层", "arrangeInFront:", ""));
+    menu_bar.addItem(&top_menu(mtm, "窗口", &window_menu));
 
     app.setMainMenu(Some(&menu_bar));
 }
