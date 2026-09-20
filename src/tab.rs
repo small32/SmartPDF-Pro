@@ -20,6 +20,10 @@ struct RenderRequest {
     page: usize,
     zoom: f32,
     scale: f32,
+    /// 优先请求（用户视线中心页，如点击缩略图跳转的目标页）。渲染线程每轮
+    /// 会把通道里积压的请求一次取出并优先处理这一类，避免预取请求排在
+    /// 前面导致跳页后长时间停留在模糊占位图上。
+    priority: bool,
 }
 
 /// 渲染结果（渲染线程 → UI）。
@@ -54,30 +58,49 @@ struct CachedPage {
 
 /// 渲染线程主体：持有独立的 Document 实例（MuPDF 原生指针不可跨线程，
 /// 但可以在本线程内长期复用），循环处理请求。
+///
+/// 每轮先把通道里积压的请求一次排空取出，稳定排序让 `priority` 请求
+/// 插队优先渲染（同级保持 FIFO），保证「点击缩略图/翻页」后目标页
+/// 最快出图，不被更早进入通道的预取请求挡住。
 fn render_worker(path: PathBuf, rx: Receiver<RenderRequest>, tx: Sender<RenderResult>) {
     let mut doc: Option<Document> = None;
-    while let Ok(req) = rx.recv() {
-        let RenderRequest {
+    loop {
+        // 排空通道：取第一个请求（阻塞等待），再收集本轮已就绪的其余请求。
+        let mut batch: Vec<RenderRequest> = Vec::new();
+        match rx.recv() {
+            Ok(first) => batch.push(first),
+            Err(_) => break, // 发送端全部关闭，渲染线程退出
+        }
+        while let Ok(more) = rx.try_recv() {
+            batch.push(more);
+        }
+        // 稳定排序：优先请求在前，同级保持原到达顺序（FIFO）。
+        batch.sort_by_key(|req| !req.priority);
+
+        for RenderRequest {
             page,
             zoom,
             scale,
-        } = req;
-        if doc.is_none() {
-            match Document::open(&path) {
-                Ok(d) => doc = Some(d),
-                Err(error) => {
-                    let _ = tx.send(RenderResult {
-                        page,
-                        zoom,
-                        rendered: Err(error),
-                    });
-                    continue;
+            ..
+        } in batch
+        {
+            if doc.is_none() {
+                match Document::open(&path) {
+                    Ok(d) => doc = Some(d),
+                    Err(error) => {
+                        let _ = tx.send(RenderResult {
+                            page,
+                            zoom,
+                            rendered: Err(error),
+                        });
+                        continue;
+                    }
                 }
             }
-        }
-        if let Some(d) = doc.as_ref() {
-            let rendered = d.render_page(page, scale);
-            let _ = tx.send(RenderResult { page, zoom, rendered });
+            if let Some(d) = doc.as_ref() {
+                let rendered = d.render_page(page, scale);
+                let _ = tx.send(RenderResult { page, zoom, rendered });
+            }
         }
     }
 }
@@ -103,6 +126,9 @@ pub struct DocTab {
     res_rx: Receiver<RenderResult>,
     /// 在途请求集合（同一 key 不重复发送；正文与缩略图缩放不同，多个 key 并存）。
     pending: std::collections::HashSet<RenderKey>,
+    /// 在途请求的发出时刻。渲染线程异常退出等情况下结果可能永远不会到达，超时后回收
+    /// 该 key（否则该页永久空白，且 UI 会为一个永不到达的结果持续排帧重绘）。
+    pending_since: HashMap<RenderKey, Instant>,
     /// 最近失败的请求；短暂冷却后允许重试，避免永久空白和每帧重试。
     failed_at: HashMap<RenderKey, Instant>,
 }
@@ -111,6 +137,8 @@ impl DocTab {
     /// 缓存页数上限：缩略图与正文共存（不同缩放），太小会频繁淘汰导致反复渲染。
     const CACHE_LIMIT: usize = 64;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
+    /// 在途请求超时：超过该时长仍未收到结果即视为丢失，解除占位以便重新发起。
+    const PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 
     pub fn open(path: &Path) -> Result<Self, String> {
         let doc = Document::open(path)?;
@@ -137,6 +165,7 @@ impl DocTab {
             req_tx,
             res_rx,
             pending: std::collections::HashSet::new(),
+            pending_since: HashMap::new(),
             failed_at: HashMap::new(),
         })
     }
@@ -160,7 +189,10 @@ impl DocTab {
     // ---- 渲染请求 / 结果收集 ----
 
     /// 请求渲染指定页（未缓存且不在途时才发送）。
-    pub fn request_render(&mut self, page: usize, zoom: f32, max_texture_side: usize) {
+    ///
+    /// `priority = true` 表示该页是用户当前视线中心（跳转目标页/当前页），
+    /// 渲染线程会插队优先处理；预取页（视口上下各一页）用 `false`。
+    pub fn request_render(&mut self, page: usize, zoom: f32, max_texture_side: usize, priority: bool) {
         let key = Self::key(page, zoom);
         if self.caches.contains_key(&key) || self.pending.contains(&key) {
             return;
@@ -175,9 +207,15 @@ impl DocTab {
         self.failed_at.remove(&key);
         self.pending.insert(key);
         let scale = self.render_scale(page, zoom, max_texture_side);
-        if self.req_tx.send(RenderRequest { page, zoom, scale }).is_err() {
+        if self
+            .req_tx
+            .send(RenderRequest { page, zoom, scale, priority })
+            .is_err()
+        {
             self.pending.remove(&key);
             self.failed_at.insert(key, Instant::now());
+        } else {
+            self.pending_since.insert(key, Instant::now());
         }
     }
 
@@ -198,6 +236,7 @@ impl DocTab {
         while let Ok(res) = self.res_rx.try_recv() {
             let key = Self::key(res.page, res.zoom);
             self.pending.remove(&key);
+            self.pending_since.remove(&key);
             let rendered = match res.rendered {
                 Ok(rendered) => {
                     self.failed_at.remove(&key);
@@ -232,7 +271,32 @@ impl DocTab {
             self.caches.insert(key, CachedPage { handle });
             inserted = true;
         }
+        // 超时回收：长时间无结果的在途请求视为丢失，解除占位（下次会被重新请求）。
+        let expired: Vec<RenderKey> = self
+            .pending_since
+            .iter()
+            .filter(|(_, sent_at)| sent_at.elapsed() > Self::PENDING_TIMEOUT)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in expired {
+            log::warn!(
+                "渲染结果超时未返回，重新排队: page={} zoom_permille={}",
+                key.0,
+                key.1
+            );
+            self.pending.remove(&key);
+            self.pending_since.remove(&key);
+            self.failed_at.insert(key, Instant::now());
+        }
         inserted
+    }
+
+    /// 是否仍有渲染请求在途。
+    ///
+    /// 供 UI 决定是否需要继续排帧：渲染线程出图后没有任何输入事件时，eframe 会回到
+    /// 空闲状态，新纹理不会被画出来（表现为「点了缩略图主区迟迟不刷新」）。
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     // ---- 获取显示纹理 ----
@@ -279,6 +343,7 @@ mod tests {
                 page: 0,
                 zoom: 1.0,
                 scale: 1.5,
+                priority: false,
             })
             .unwrap();
         drop(req_tx); // 让 worker 循环在完成后退出
@@ -307,6 +372,7 @@ mod tests {
                 page: usize::MAX,
                 zoom: 1.0,
                 scale: 1.5,
+                priority: false,
             })
             .unwrap();
         drop(req_tx);

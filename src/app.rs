@@ -14,6 +14,7 @@ use eframe::egui::{
     ScrollArea, Vec2,
 };
 use eframe::egui::load::SizedTexture;
+use eframe::egui::containers::scroll_area::ScrollSource;
 // CoreText：枚举系统字体供「设置」选择；ab_glyph 校验所选字体可渲染
 use objc2_core_foundation::{CFString, CFURL, CFURLPathStyle};
 use objc2_core_text::{
@@ -296,6 +297,9 @@ pub struct SmartPdfApp {
     doc_scroll_y: f32,
     /// 连续模式主文档内容总高度（像素），供缩略图栏换算跟随比例 k = 缩略图总高 / 此值。
     doc_total_height: f32,
+    /// 一次性强制主文档区滚动到指定偏移（由悬停缩略图栏滚轮触发）；下一帧由 doc_panel
+    /// 消费并清空。与 scroll_target 跳页同通道，避免每帧覆盖用户在主区的自由滚动。
+    doc_scroll_force: Option<f32>,
     /// 「设置」窗口是否打开。
     show_settings: bool,
     /// 用户选择的界面字体文件路径（None = 系统默认）。
@@ -331,6 +335,7 @@ impl SmartPdfApp {
             thumb_fit_width: 0.0,
             doc_scroll_y: 0.0,
             doc_total_height: 0.0,
+            doc_scroll_force: None,
             show_settings: false,
             ui_font: saved_font,
             settings_pending: None,
@@ -361,6 +366,7 @@ impl SmartPdfApp {
                 // 新文档从顶部开始：清空主区滚动位置，缩略图栏随之归零。
                 self.doc_scroll_y = 0.0;
                 self.doc_total_height = 0.0;
+                self.doc_scroll_force = None;
                 self.status = format!("已打开「{}」", title);
             }
             Err(e) => self.status = format!("无法打开 {}：{}", path.display(), e),
@@ -561,6 +567,17 @@ impl SmartPdfApp {
         }
     }
 
+    /// 渲染线程仍有请求在途时，安排下一帧重绘。
+    ///
+    /// 必须在本帧面板渲染之后调用：本帧新发出的请求（例如点选缩略图后跳页的目标页）
+    /// 也要纳入判断。否则点击后 eframe 立刻回到空闲，渲染线程虽然出了图，却没有下一帧
+    /// 把它画出来——只能等下一次输入事件（鼠标移动）才刷新，表现为跳转「不立即」。
+    fn keep_repainting_while_rendering(&self, ctx: &egui::Context) {
+        if self.tabs.iter().any(|tab| tab.has_pending()) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
 
     // ---- 左侧缩略图面板 ----
 
@@ -598,7 +615,25 @@ impl SmartPdfApp {
         // 因此不存在反馈环路，主文档区始终可自由滚动到任意页。点击缩略图跳页走 scroll_target（主区一次性跳页）。
         let want = self.doc_scroll_y * k;
 
-        let scroll = ScrollArea::vertical().id_salt("thumbs").vertical_scroll_offset(want);
+        // 滚轮驱动主文档：指针悬停缩略图栏时滚轮不应被本栏吞掉，而是换算为主文档滚动。
+        // egui 滚轮语义：delta 正 = 内容向上滚（offset 减小），负 = 向下。按 k 的倒数换算到
+        // 主文档坐标系。本栏自身禁用 mouse_wheel（SCROLL_BAR），避免同一份 delta 被两个
+        // ScrollArea 消费。主文档上限由 ScrollArea 内部自行夹取，这里只需保证非负。
+        // 写入 doc_scroll_y 后，doc_panel 本帧回灌的是 viewport.min.y（旧值），会覆盖——
+        // 因此用 doc_scroll_force 一次性强制主区到新位置（与跳页同通道），下帧回灌接续。
+        let wheel_y = ui.ctx().input(|i| i.smooth_scroll_delta().y);
+        if wheel_y != 0.0 && ui.rect_contains_pointer(ui.max_rect()) && k > 0.0 {
+            let new_doc = (self.doc_scroll_y - wheel_y / k).max(0.0);
+            if (new_doc - self.doc_scroll_y).abs() > f32::EPSILON {
+                self.doc_scroll_y = new_doc;
+                self.doc_scroll_force = Some(new_doc);
+            }
+        }
+
+        let scroll = ScrollArea::vertical()
+            .id_salt("thumbs")
+            .scroll_source(ScrollSource::SCROLL_BAR)
+            .vertical_scroll_offset(want);
         scroll.show_viewport(ui, |ui, viewport| {
             ui.set_height(total_height);
             let content_top = ui.max_rect().top();
@@ -608,8 +643,8 @@ impl SmartPdfApp {
                 // 自适应缩放：渲染缩放使页面宽度铺满 zoom_base（egui 点），含 ppp 修正
                 let zoom =
                     (zoom_base * ppp / (w_pt * scale_px_per_pt(1.0))).clamp(0.05, 8.0);
-                // 只对可见缩略图发起渲染请求
-                self.tabs[i].request_render(p, zoom, max_texture_side);
+                // 只对可见缩略图发起渲染请求（低优先级：缩略图不与正文抢渲染队列）
+                self.tabs[i].request_render(p, zoom, max_texture_side, false);
                 // 按真实累计高度布置，避免不同尺寸页面导致虚拟滚动偏移。
                 let row_w = ui.available_width().max(20.0);
                 let row_rect = egui::Rect::from_min_size(
@@ -621,6 +656,10 @@ impl SmartPdfApp {
                         egui::UiBuilder::new()
                             .id_salt(("thumb", p))
                             .max_rect(row_rect)
+                            // 必须显式声明 click 感知：`UiBuilder` 默认 sense 是
+                            // `Sense::hover()`（即空感知），此时 scope_builder 返回的
+                            // `.response.clicked()` 恒为 false——点击永远不会被注册。
+                            .sense(egui::Sense::click())
                             .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
                         |ui| {
                             if let Some(tid) = self.tabs[i].display_texture_at(p, zoom) {
@@ -631,9 +670,16 @@ impl SmartPdfApp {
                         },
                     )
                     .response;
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
                 if resp.clicked() {
+                    // 点选缩略图：goto 直接改写当前页，scroll_target 让 doc_panel 在本帧
+                    // 一次性把主区强制到该页偏移（不等任何动画/惯性），再补一次重绘，
+                    // 保证跳转与目标页出图都不必等下一次输入事件。
                     self.tabs[i].goto(p);
                     self.scroll_target = Some(p);
+                    ui.ctx().request_repaint();
                 }
             }
         });
@@ -680,7 +726,11 @@ impl SmartPdfApp {
         match self.view_mode {
             ViewMode::Single => {
                 let page = self.tabs[i].page;
-                self.tabs[i].request_render(page, zoom, max_texture_side);
+                // 单页模式没有连续滚动的偏移量，跳页由 goto() 直接生效；清掉可能残留的
+                // scroll_target，避免之后切回连续模式时凭空跳到旧目标页。
+                self.scroll_target = None;
+                // 单页模式当前页即视线中心，优先渲染。
+                self.tabs[i].request_render(page, zoom, max_texture_side, true);
                 ui.centered_and_justified(|ui| {
                     if let Some(tid) = self.tabs[i].display_texture_for(page) {
                         let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(page);
@@ -705,13 +755,19 @@ impl SmartPdfApp {
                         scroll = scroll.vertical_scroll_offset(self.doc_scroll_y);
                     }
                 }
+                // 悬停缩略图栏滚轮：一次性强制主区到换算后的新位置，消费即清空。
+                if let Some(f) = self.doc_scroll_force.take() {
+                    self.doc_scroll_y = f;
+                    scroll = scroll.vertical_scroll_offset(f);
+                }
 
                 scroll.show_viewport(ui, |ui, viewport| {
                     ui.set_height(total_height);
                     let content_top = ui.max_rect().top();
                     // 回灌：用户拖动主滚动条时，把主区实际偏移写回共享位置，驱动缩略图栏跟随。
                     self.doc_scroll_y = viewport.min.y;
-                    if let Some(current) = page_at_offset(&offsets, viewport.center().y) {
+                    let center_page = page_at_offset(&offsets, viewport.center().y);
+                    if let Some(current) = center_page {
                         self.tabs[i].page = current;
                     }
 
@@ -719,8 +775,10 @@ impl SmartPdfApp {
                         let (w_pt, h_pt) = self.tabs[i].doc.page_size_pt(p);
                         let w = w_pt * px_per_pt / ppp;
                         let h = h_pt * px_per_pt / ppp;
-                        // 请求渲染（未缓存/未在途才发送）
-                        self.tabs[i].request_render(p, zoom, max_texture_side);
+                        // 请求渲染（未缓存/未在途才发送）：视线中心页优先，
+                        // 其余可见页（含上下预取）普通优先级，保证跳页目标最快出图。
+                        let is_center = center_page == Some(p);
+                        self.tabs[i].request_render(p, zoom, max_texture_side, is_center);
                         let row_rect = egui::Rect::from_min_size(
                             egui::pos2(ui.max_rect().left(), content_top + offsets[p]),
                             Vec2::new(avail_w, h),
@@ -926,7 +984,9 @@ impl SmartPdfApp {
         let lo = page.saturating_sub(1);
         let hi = (page + 1).min(page_count.saturating_sub(1));
         for np in lo..=hi {
-            self.tabs[i].request_render(np, pres_zoom, max_texture_side);
+            // 演示模式当前页优先，相邻页普通优先级。
+            let is_current = np == page;
+            self.tabs[i].request_render(np, pres_zoom, max_texture_side, is_current);
         }
 
         // 黑底
@@ -1006,6 +1066,7 @@ impl eframe::App for SmartPdfApp {
         if self.presenting {
             // 演示模式：全屏单页（类 PPT）
             egui::CentralPanel::default().show(ui, |ui| self.presentation_panel(ui));
+            self.keep_repainting_while_rendering(&ctx);
             return;
         }
 
@@ -1053,6 +1114,7 @@ impl eframe::App for SmartPdfApp {
         if self.show_settings {
             self.settings_window(&ctx);
         }
+        self.keep_repainting_while_rendering(&ctx);
     }
 }
 
