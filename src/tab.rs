@@ -54,6 +54,8 @@ fn clamp_render_scale(
 /// UI 线程持有的页面缓存（GPU 纹理）。
 struct CachedPage {
     handle: TextureHandle,
+    /// 纹理像素数（宽×高），用于像素预算统计。
+    pixels: u64,
 }
 
 /// 渲染线程主体：持有独立的 Document 实例（MuPDF 原生指针不可跨线程，
@@ -118,10 +120,12 @@ pub struct DocTab {
     pub fit_width: bool,
     /// 上次计算 fit_width 时的文档区域宽度（用于避免每帧振荡重算；不含左侧缩略图栏）。
     pub fit_width_viewport: f32,
-    /// 多页渲染缓存，缓存页数上限见 [`Self::CACHE_LIMIT`]。
+    /// 多页渲染缓存，条数上限见 [`Self::CACHE_LIMIT`]，像素预算见 [`Self::CACHE_PIXEL_BUDGET`]。
     caches: HashMap<RenderKey, CachedPage>,
-    /// 插入顺序（用于清理最旧缓存）。
+    /// LRU 顺序（最旧在前）：展示命中与插入都会把 key 移到末尾。
     order: Vec<RenderKey>,
+    /// 当前缓存的像素总量（宽×高之和），用于像素预算淘汰。
+    cached_pixels: u64,
     req_tx: Sender<RenderRequest>,
     res_rx: Receiver<RenderResult>,
     /// 在途请求集合（同一 key 不重复发送；正文与缩略图缩放不同，多个 key 并存）。
@@ -134,8 +138,11 @@ pub struct DocTab {
 }
 
 impl DocTab {
-    /// 缓存页数上限：缩略图与正文共存（不同缩放），太小会频繁淘汰导致反复渲染。
-    const CACHE_LIMIT: usize = 64;
+    /// 缓存条数上限：缩略图与正文共存（不同缩放），太小会频繁淘汰导致反复渲染。
+    const CACHE_LIMIT: usize = 32;
+    /// 缓存像素总量预算（宽×高之和，约 96MB RGBA）：正文大图与缩略图共存时
+    /// 仅靠条数无法约束内存（32 张 Retina 全页纹理可达数百 MB），故叠加像素预算。
+    const CACHE_PIXEL_BUDGET: u64 = 24_000_000;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
     /// 在途请求超时：超过该时长仍未收到结果即视为丢失，解除占位以便重新发起。
     const PENDING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -162,6 +169,7 @@ impl DocTab {
             fit_width_viewport: 0.0,
             caches: HashMap::new(),
             order: Vec::new(),
+            cached_pixels: 0,
             req_tx,
             res_rx,
             pending: std::collections::HashSet::new(),
@@ -256,10 +264,18 @@ impl DocTab {
             if self.caches.contains_key(&key) {
                 continue;
             }
-            // 清理最旧缓存，控制内存
-            if self.order.len() >= Self::CACHE_LIMIT {
-                let oldest = self.order.remove(0);
-                self.caches.remove(&oldest);
+            // 淘汰最旧缓存，直到条数与像素预算都能容纳新纹理（LRU 顺序最旧在前）
+            let new_pixels = (rendered.width * rendered.height) as u64;
+            while self.order.len() >= Self::CACHE_LIMIT
+                || self.cached_pixels + new_pixels > Self::CACHE_PIXEL_BUDGET
+            {
+                let Some(oldest) = self.order.first().copied() else {
+                    break; // 缓存已空（新纹理自身超出预算时也直接插入）
+                };
+                self.order.remove(0);
+                if let Some(old) = self.caches.remove(&oldest) {
+                    self.cached_pixels -= old.pixels;
+                }
             }
             let image = ColorImage::from_rgba_unmultiplied(
                 [rendered.width, rendered.height],
@@ -268,7 +284,14 @@ impl DocTab {
             let handle = ctx.load_texture("page", image, TextureOptions::LINEAR);
             self.order.retain(|k| *k != key);
             self.order.push(key);
-            self.caches.insert(key, CachedPage { handle });
+            self.cached_pixels += new_pixels;
+            self.caches.insert(
+                key,
+                CachedPage {
+                    handle,
+                    pixels: new_pixels,
+                },
+            );
             inserted = true;
         }
         // 超时回收：长时间无结果的在途请求视为丢失，解除占位（下次会被重新请求）。
@@ -301,19 +324,26 @@ impl DocTab {
 
     // ---- 获取显示纹理 ----
 
-    /// 指定页的显示纹理（优先精确缩放，其次该页任意缩放，避免翻页白屏）。
-    pub fn display_texture_for(&self, page: usize) -> Option<TextureId> {
+    /// 指定页的显示纹理（优先精确缩放，其次该页最清晰的缩放，避免翻页白屏）。
+    pub fn display_texture_for(&mut self, page: usize) -> Option<TextureId> {
         self.display_texture_at(page, self.zoom)
     }
 
-    /// 指定缩放下的页面纹理（优先精确 key，其次该页任意缩放）。
-    pub fn display_texture_at(&self, page: usize, zoom: f32) -> Option<TextureId> {
-        if let Some(c) = self.caches.get(&Self::key(page, zoom)) {
-            return Some(c.handle.id());
+    /// 指定缩放下的页面纹理（优先精确 key，其次该页缩放最大的缓存）。
+    /// 精确命中时刷新 LRU 顺序，避免正在展示的页被淘汰。
+    pub fn display_texture_at(&mut self, page: usize, zoom: f32) -> Option<TextureId> {
+        let key = Self::key(page, zoom);
+        if let Some(c) = self.caches.get(&key) {
+            let id = c.handle.id();
+            self.order.retain(|k| *k != key);
+            self.order.push(key);
+            return Some(id);
         }
+        // 兜底：取该页缩放最大（最清晰）的缓存，避免拿到低清缩略图拉伸成整页。
         self.caches
             .iter()
-            .find(|((p, _), _)| *p == page)
+            .filter(|((p, _), _)| *p == page)
+            .max_by_key(|((_, zoom_permille), _)| *zoom_permille)
             .map(|(_, c)| c.handle.id())
     }
 

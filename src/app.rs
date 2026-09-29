@@ -274,6 +274,8 @@ pub struct SmartPdfApp {
     active: Option<usize>,
     view_mode: ViewMode,
     status: String,
+    /// 状态栏消息的设置时刻（5 秒后自动清除，避免旧消息常驻）。
+    status_at: std::time::Instant,
     /// 连续模式下需要滚动到的页（翻页/缩略图跳页后置位，下一帧应用）。
     scroll_target: Option<usize>,
     /// 是否处于演示模式（类 PPT 全屏单页）。
@@ -307,6 +309,9 @@ pub struct SmartPdfApp {
     /// 字体设置窗口中「待确认」的选择（跨帧保留）：
     /// Some(Some(path)) = 选了某字体；Some(None) = 选了系统默认；None = 尚未点选。
     settings_pending: Option<Option<String>>,
+    /// 系统字体枚举缓存（首次打开「字体设置」时惰性填充）：
+    /// CoreText 全量枚举开销大，不能在窗口打开期间每帧重算。
+    font_list: Option<Vec<(String, String)>>,
 }
 
 impl SmartPdfApp {
@@ -323,6 +328,7 @@ impl SmartPdfApp {
             active: None,
             view_mode: ViewMode::Continuous,
             status: String::new(),
+            status_at: std::time::Instant::now(),
             scroll_target: None,
             presenting: false,
             dock_icon_done: false,
@@ -339,6 +345,7 @@ impl SmartPdfApp {
             show_settings: false,
             ui_font: saved_font,
             settings_pending: None,
+            font_list: None,
         };
         for f in files {
             app.open_path(&f);
@@ -352,10 +359,19 @@ impl SmartPdfApp {
 
     // ---- 打开 / 关闭 ----
 
+    /// 设置状态栏消息并记录时间（到时自动清除）。
+    fn set_status(&mut self, msg: String) {
+        self.status = msg;
+        self.status_at = std::time::Instant::now();
+    }
+
     fn open_path(&mut self, path: &Path) {
+        // 规范化路径：符号链接/相对路径指向同一文件时不重复开标签
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path = canonical.as_path();
         if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
             self.active = Some(i);
-            self.status = format!("已在标签页中打开：{}", path.display());
+            self.set_status(format!("已在标签页中打开：{}", path.display()));
             return;
         }
         match DocTab::open(path) {
@@ -367,9 +383,9 @@ impl SmartPdfApp {
                 self.doc_scroll_y = 0.0;
                 self.doc_total_height = 0.0;
                 self.doc_scroll_force = None;
-                self.status = format!("已打开「{}」", title);
+                self.set_status(format!("已打开「{}」", title));
             }
-            Err(e) => self.status = format!("无法打开 {}：{}", path.display(), e),
+            Err(e) => self.set_status(format!("无法打开 {}：{}", path.display(), e)),
         }
     }
 
@@ -398,7 +414,7 @@ impl SmartPdfApp {
             return;
         }
         let removed = self.tabs.remove(idx).title.clone();
-        self.status = format!("已关闭「{}」", removed);
+        self.set_status(format!("已关闭「{}」", removed));
         self.active = if self.tabs.is_empty() {
             None
         } else {
@@ -485,7 +501,51 @@ impl SmartPdfApp {
         ui.separator();
             // ＋ 与分隔符之后剩下的宽度才是标签可用宽度
             let widths = fit_title_widths(ui, &titles, ui.available_width());
-            for ((idx, title, is_active), max_text_w) in items.into_iter().zip(widths) {
+            // 标签过多放不下时：优先保证活动标签可见，从它向两侧按宽度交替扩展，
+            // 放不下的标签隐藏（不渲染），避免压缩后总宽仍超出窗口被裁掉。
+            let n = items.len();
+            let active_pos = items
+                .iter()
+                .position(|(idx, _, _)| Some(*idx) == self.active)
+                .unwrap_or(n.saturating_sub(1));
+            let mut visible = vec![false; n];
+            visible[active_pos] = true;
+            let mut used = TAB_FIXED_W + widths[active_pos];
+            let mut lo = active_pos;
+            let mut hi = active_pos + 1;
+            while lo > 0 || hi < n {
+                let next_left = if lo > 0 { lo - 1 } else { usize::MAX };
+                let next_right = if hi < n { hi } else { usize::MAX };
+                // 两侧候选中先放较宽的一个（更可能放不下，尽早决策）
+                let take = if next_left != usize::MAX
+                    && (next_right == usize::MAX || widths[next_left] >= widths[next_right])
+                {
+                    next_left
+                } else {
+                    next_right
+                };
+                if take == usize::MAX {
+                    break;
+                }
+                let w = TAB_FIXED_W + widths[take];
+                if used + w + TAB_SPACING > ui.available_width() {
+                    break;
+                }
+                used += w + TAB_SPACING;
+                visible[take] = true;
+                if take < active_pos {
+                    lo = take;
+                } else {
+                    hi = take + 1;
+                }
+            }
+            let hidden = n - visible.iter().filter(|v| **v).count();
+            for (((idx, title, is_active), max_text_w), show) in
+                items.into_iter().zip(widths).zip(visible)
+            {
+                if !show {
+                    continue;
+                }
                 match tab_item(ui, &title, is_active, max_text_w) {
                     TabAction::Close => {
                         // 双击标签关闭：标记 consumed 以免触发"双击标题栏放大"
@@ -495,6 +555,9 @@ impl SmartPdfApp {
                     TabAction::Activate => activate = Some(idx),
                     TabAction::None => {}
                 }
+            }
+            if hidden > 0 {
+                ui.label(format!("+{hidden}"));
             }
         });
 
@@ -805,6 +868,12 @@ impl SmartPdfApp {
     // ---- 底部状态栏 ----
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        // 状态消息 5 秒后自动清除，避免旧消息常驻状态栏
+        if !self.status.is_empty()
+            && self.status_at.elapsed() > std::time::Duration::from_secs(5)
+        {
+            self.status.clear();
+        }
         let Some(i) = self.active_idx() else {
             return;
         };
@@ -856,14 +925,15 @@ impl SmartPdfApp {
         }
 
         let cmd = Modifiers::COMMAND;
-        // 进入演示：⌘Return 从当前页；⇧⌘Return 从头开始
-        if ctx.input_mut(|i| i.consume_key(cmd, Key::Enter)) {
-            self.start_presentation(ctx);
-        }
+        // 进入演示：⇧⌘Return 从头开始；⌘Return 从当前页。
+        // 必须先判带 SHIFT 的：consume_key 的修饰键匹配会忽略多余的 Shift，
+        // 若先判 ⌘Return，⇧⌘Return 会被它抢先消费。
         if ctx.input_mut(|i| {
             i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Enter)
         }) {
             self.start_presentation_from_beginning(ctx);
+        } else if ctx.input_mut(|i| i.consume_key(cmd, Key::Enter)) {
+            self.start_presentation(ctx);
         }
         if ctx.input_mut(|i| i.consume_key(cmd, Key::O)) {
             self.pick_and_open();
@@ -1016,8 +1086,8 @@ impl SmartPdfApp {
             );
         }
 
-        // 页码指示（右下角）
-        let text = format!("{page} / {}", page_count + 1);
+        // 页码指示（右下角）：page 为 0 基，显示需 +1
+        let text = format!("{} / {page_count}", page + 1);
         ui.painter().text(
             egui::pos2(rect.right() - 20.0, rect.bottom() - 20.0),
             Align2::RIGHT_BOTTOM,
@@ -1201,9 +1271,10 @@ fn font_is_renderable(bytes: &[u8]) -> bool {
     let Ok(font) = FontArc::try_from_vec(bytes.to_vec()) else {
         return false;
     };
-    // 检查常见字符是否有字形：拉丁字母、数字、中文
+    // 检查常见字符是否都有字形：拉丁字母、数字、中文。
+    // 用 all 而非 any：缺中文字形的纯拉丁字体不应通过界面字体校验。
     let probes = ['A', '1', '中'];
-    probes.iter().any(|c| font.glyph_id(*c).0 != 0)
+    probes.iter().all(|c| font.glyph_id(*c).0 != 0)
 }
 
 /// 枚举系统字体：返回 (家族名, 文件路径) 列表。
@@ -1314,7 +1385,12 @@ impl SmartPdfApp {
                     ui.label("默认使用 macOS 自带苹方（PingFang）；也可选择其他系统字体：");
                     ui.add_space(6.0);
 
-                    let fonts = list_system_fonts();
+                    // CoreText 枚举只跑一次，之后复用缓存（克隆出来避免与
+                    // 闭包内对 self 的可变借用冲突）。
+                    let fonts = self
+                        .font_list
+                        .get_or_insert_with(list_system_fonts)
+                        .clone();
 
                     egui::ScrollArea::vertical()
                         .max_height(280.0)

@@ -22,7 +22,7 @@ UI 完全绑定 Windows 的 Win32/WPF，本身不支持 macOS。逐文件移植�
 | GUI       | [`eframe/egui`](https://crates.io/crates/eframe) 0.36    | 纯 Rust 即时模式 GUI，跨平台，macOS 原生运行                    |
 | 文件对话框     | [`rfd`](https://crates.io/crates/rfd)                    | 调用 macOS 系统原生面板                                   |
 
-MuPDF 内置解析器：**PDF、EPUB、MOBI/AZW3、FB2、CBZ/CBR、XPS、SVG、DjVu** ——
+MuPDF 内置解析器：**PDF、EPUB、MOBI/AZW3、FB2、CBZ、XPS、SVG** ——
 与 SumatraPDF 的多格式卖点一一对应。**OFD（GB/T 33190—2016）** 不在 MuPDF 之列，
 由项目依赖的 `ofd-core` 渲染。
 
@@ -42,7 +42,7 @@ MuPDF 内置解析器：**PDF、EPUB、MOBI/AZW3、FB2、CBZ/CBR、XPS、SVG、D
 
 - ✅ 视图模式：菜单 → 视图 → 单页 / 连续显示页面
 
-- ✅ **后台渲染**：页面渲染在独立线程完成，翻页缩放不卡 UI（结果经 channel 回传为 GPU 纹理缓存，上限 10 页 LRU 淘汰）
+- ✅ **后台渲染**：页面渲染在独立线程完成，翻页缩放不卡 UI（结果经 channel 回传为 GPU 纹理缓存，真 LRU 淘汰，条数上限 32 + 像素预算双约束）
 
 - ✅ **SumatraPDF 经典布局**：左侧页面缩略图导航（点击跳页），右侧整篇文档纵向连续滚动
 
@@ -61,7 +61,7 @@ MuPDF 内置解析器：**PDF、EPUB、MOBI/AZW3、FB2、CBZ/CBR、XPS、SVG、D
 
 ## 构建 & 运行
 
-依赖：Rust ≥ 1.95、CMake、C/C++ 工具链（`brew install cmake`）。
+依赖：Rust ≥ 1.95、C/C++ 工具链（Xcode Command Line Tools）。
 
 ```bash
 # 构建（首次会编译 MuPDF C 引擎，需几分钟）
@@ -74,7 +74,7 @@ cargo run -- samples/demo.pdf
 cargo run --example render_check
 ```
 
-> macOS 上构建注意：`mupdf-sys` 用 CMake 编译，需要系统里有 `cmake`；
+> macOS 上构建注意：`mupdf-sys` 通过 `cc` 直接编译 MuPDF C 源码（无需 CMake）；
 > 默认特性已包含 system-fonts（调用 macOS CoreText 系统字库）。
 
 ## 打包成 macOS 应用（.app）
@@ -133,7 +133,7 @@ examples/
 渲染管线：UI 线程把 `(页码, 缩放)` 请求投递给每个标签页专属的
 渲染 worker 线程（**MuPDF 原生指针不可跨线程，worker 在自己的线程内长期持有一份
 `Document`** **实例**）；worker 用 MuPDF 渲染出 RGBA 像素，经 channel 回传，UI 线程
-上传为 GPU 纹理并缓存（上限 10 页，LRU 淘汰）。渲染结果到达后自动请求重绘，
+上传为 GPU 纹理并缓存（真 LRU 淘汰：条数上限 32 + 像素预算双约束）。渲染结果到达后自动请求重绘，
 未出图时显示占位，翻页瞬间显示旧缓存。
 
 ## 测试
@@ -144,7 +144,7 @@ cargo test        # 渲染 worker 闭环 + 页码跳转钳制
 
 ## 已知边界
 
-- 连续模式用 `ScrollArea::show_rows` 只渲染可见行；`pending` 为单槽位，正文与缩略图并发请求会互相覆盖（功能正常，可改为集合）。
+- 连续模式用 `ScrollArea::show_rows` 只渲染可见行；`pending` 为在途请求集合（`HashSet`），正文与缩略图的不同缩放可并发请求，互不覆盖。
 
 - 文件打开（解析元数据）为同步操作，超大文档首次打开须等待片刻。
 

@@ -1,5 +1,5 @@
 //! 文档层。
-//! - 对 MuPDF 的封装：PDF/EPUB/MOBI/CBZ/FB2/XPS/SVG/DjVu 等格式；
+//! - 对 MuPDF 的封装：PDF/EPUB/MOBI/CBZ/FB2/XPS/SVG 等格式；
 //! - 对 ofd-core 的封装：OFD（GB/T 33190—2016）格式。
 //! 统一对外暴露页数、页尺寸（pt）与按缩放渲染页面像素的接口。
 
@@ -258,9 +258,11 @@ fn is_ofd(path: &Path) -> bool {
 }
 
 /// 支持打开的文件扩展名（对应 SumatraPDF 支持的多格式 + OFD）。
+// 注意：不含 djvu（捆绑的 MuPDF 1.27.2 无 DjVu 解码器）；
+// 不含 cbr/cb7（RAR/7z 需 mupdf-sys 的 libarchive 特性，未启用），仅 zip 系 cbz 可开。
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "pdf", "epub", "mobi", "azw", "azw3", "fb2", "cbz", "cbr", "cb7",
-    "xps", "oxps", "svg", "djvu", "ofd",
+    "pdf", "epub", "mobi", "azw", "azw3", "fb2", "cbz", "xps", "oxps",
+    "svg", "ofd",
 ];
 
 #[cfg(test)]

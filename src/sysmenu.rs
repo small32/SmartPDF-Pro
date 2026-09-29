@@ -286,7 +286,10 @@ pub fn install_file_open_handlers() {
                 types.as_ptr(),
             )
         };
-        assert!(bool::from(added), "无法为 winit delegate 安装 {selector:?}");
+        if !bool::from(added) {
+            // 宿主框架可能已提供该方法；降级为日志，避免启动即 panic
+            log::error!("无法为 winit delegate 安装 {selector:?}，文件打开事件可能无法接收");
+        }
     }
     unsafe {
         add(cls, objc2::sel!(application:openURLs:), application_open_urls as *const (), "v@:@@");
