@@ -2,99 +2,82 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>
-    <string>SmartPDF Pro</string>
-
-    <key>CFBundleDisplayName</key>
-    <string>SmartPDF Pro</string>
-
-    <key>CFBundleIdentifier</key>
-    <string>local.smartpdf.pro.reader</string>
-
-    <key>CFBundleExecutable</key>
-    <string>SmartPDF Pro</string>
-
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-
-    <key>CFBundleShortVersionString</key>
-    <string>0.3.5</string>
-
-    <key>CFBundleVersion</key>
-    <string>0.3.5</string>
-
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-
-    <key>LSMinimumSystemVersion</key>
-    <string>12.0</string>
-
-    <key>LSApplicationCategoryType</key>
-    <string>public.app-category.productivity</string>
-
-    <!-- 声明可打开文档类型：双击 / 「打开方式」时 LaunchServices 据此路由到本 App -->
-    <key>CFBundleDocumentTypes</key>
-    <array>
-        <dict>
-            <key>CFBundleTypeName</key>
-            <string>PDF Document</string>
-            <key>CFBundleTypeRole</key>
-            <string>Viewer</string>
-            <key>LSHandlerRank</key>
-            <string>Alternate</string>
-            <key>LSItemContentTypes</key>
-            <array>
-                <string>com.adobe.pdf</string>
-            </array>
-        </dict>
-        <dict>
-            <key>CFBundleTypeName</key>
-            <string>EPUB Document</string>
-            <key>CFBundleTypeRole</key>
-            <string>Viewer</string>
-            <key>LSHandlerRank</key>
-            <string>Alternate</string>
-            <key>LSItemContentTypes</key>
-            <array>
-                <string>org.idpf.epub-container</string>
-            </array>
-        </dict>
-        <dict>
-            <key>CFBundleTypeName</key>
-            <string>CBZ Comic Archive</string>
-            <key>CFBundleTypeRole</key>
-            <string>Viewer</string>
-            <key>LSHandlerRank</key>
-            <string>Alternate</string>
-            <key>LSItemContentTypes</key>
-            <array>
-                <string>public.zip-archive</string>
-            </array>
-        </dict>
-        <dict>
-            <key>CFBundleTypeName</key>
-            <string>OFD Document</string>
-            <key>CFBundleTypeRole</key>
-            <string>Viewer</string>
-            <!-- Owner：让本 App 成为 .ofd 的默认处理器，双击即可自动打开。
-                 macOS 系统已内置 public.ofd 这个 UTI，.ofd 文件被识别为该类型，
-                 所以这里必须声明 System 域的 public.ofd，而非自定义 UTI。 -->
-            <key>LSHandlerRank</key>
-            <string>Owner</string>
-            <key>LSItemContentTypes</key>
-            <array>
-                <string>public.ofd</string>
-            </array>
-        </dict>
-    </array>
-
-    <key>NSHighResolutionCapable</key>
-    <true/>
-
-    <key>NSPrincipalClass</key>
-    <string>NSApplication</string>
-
-    <key>NSHumanReadableCopyright</key>
-    <string>SmartPDF Pro - Rust 多格式阅读器（灵感来自 SumatraPDF）</string>
+	<key>CFBundleDisplayName</key>
+	<string>SmartPDF Pro</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>PDF Document</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.adobe.pdf</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>EPUB Document</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>org.idpf.epub-container</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>CBZ Comic Archive</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.zip-archive</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>OFD Document</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.ofd</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleExecutable</key>
+	<string>SmartPDF Pro</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.smartpdf.pro.reader</string>
+	<key>CFBundleName</key>
+	<string>SmartPDF Pro</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.3.6</string>
+	<key>CFBundleVersion</key>
+	<string>0.3.6</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>SmartPDF Pro - Rust 多格式阅读器（灵感来自 SumatraPDF）</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
 </dict>
 </plist>
