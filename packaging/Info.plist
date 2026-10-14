@@ -76,7 +76,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>SmartPDF Pro - Rust 多格式阅读器（灵感来自 SumatraPDF）</string>
+	<string>SmartPDF Pro - 基于Rust的多标签页PDF等多格式阅读器</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>
